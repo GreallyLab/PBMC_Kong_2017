@@ -1,0 +1,429 @@
+---
+title: "Asthma Gene Expression Analysis"
+author: "Yu Kong and Masako"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    css: template.css
+    toc: yes
+    toc_depth: 4
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  word_document: default
+---
+
+```{r packages,echo=FALSE, warning=FALSE, message = FALSE}
+library(gplots)
+library(RColorBrewer)
+library(dendextend)
+library(ggplot2)
+library(biomaRt)
+library(reshape2)
+library(limma)
+library(VennDiagram)
+library(grid)
+library(gridExtra)
+library(goseq)
+gg_color_hue <- function(n) {
+ hues = seq(15, 375, length = n + 1)
+ hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+options(stringsAsFactors = F)
+opts_chunk$set(dpi=150,
+               dev = c("png","pdf"),
+               fig.path="knitr_figures/",
+               fig.width=7, fig.height=7,
+               fig.align='center',
+               fig.pos='htbp', echo=FALSE,
+               cache=FALSE, message=FALSE,warning=FALSE)
+```
+
+
+The accession number of this data set is GSE69683.
+
+Summary:	Severe asthma is a collection of disease entities with varying pathophysiological characteristics (7) that result in symptoms of cough, wheeze and breathlessness, with frequent exacerbations. To address the problem of phenotypic difference and heterogeneity, the Unbiased Biomarkers for the Prediction of Respiratory Disease Outcomes (U-BIOPRED) project was set up as a public-private partnership within the framework of the Innovative Medicines Initiative (IMI), engaging academia, the pharmaceutical industry and patient groups. The goal of this investigation was to identify transcript fingerprints in whole blood that characterize patients with severe asthma and to determine whether subgroups of severe asthmatics can be identified. Furthermore, we were interested in elucidating the biological pathways that showed differences between subgroups.
+ 	
+Overall design:	This is a cross-sectional study of severe asthmatics, moderate asthmatics, and healthy subjects. Blood was collected at baseline.
+
+Data processing: Scans were imported into ArrayStudio V8.0 and pre-processed using the default RMA pipeline
+
+Used platform: GPL13158
+
+# 1. Loading files and selecting samples
+
+## 1-1. Loading files and re-formating data for cibersort 
+Obtain gene information from GPL13158-5065.
+```{r loading, echo=FALSE}
+pdata <-read.table("asthma_pdata.csv",sep=",",header=T)
+affy_data <-read.table("GPL13158-5065.csv",sep=",",header=T) ## used DAVID ID conversion tool
+#data_id <-merge(affy_data,data,by="ID_REF")
+#data_id<-data_id[which(data_id[,1]!="NA"),]
+#data_id<-data_id[which(data_id[,1]!=""),]
+aggdata_genename<-read.table("exp_status_byGene.txt",sep="\t",header = T)
+```
+
+## 1-2. Selecting samples
+Since the authors only comapred between healthy and severe asthma, I dropped moderate asthma samples from the analysis.
+
+At this stage, we have:
+```{r selecting, echo=FALSE,message=FALSE}
+pdata_used<-read.table("pdata_healthy_SA.txt",sep="\t",header=T)
+aggdata_genename_used<-aggdata_genename[,which(colnames(aggdata_genename)%in%pdata_used$sample_id)]
+aggdata_genename2<-cbind(aggdata_genename[,1],aggdata_genename_used)
+colnames(aggdata_genename2)<-c("Group.1",colnames(aggdata_genename2)[2:dim(aggdata_genename2)[2]])
+aggdata_genename<-aggdata_genename2
+pdata<-pdata_used
+paste("Number of samle = ",dim(pdata)[1])
+table(pdata$Condition,pdata$Sex)
+```
+
+## 1-3. QC
+### 1-3-1. QC before Cibersort
+1. Check sex information with chrY gene expression status  
+```{r chrY, echo=FALSE,message=TRUE}
+chrYgenes<-read.csv("chrY_genes",sep="\t")
+colnames(chrYgenes)<-c("chr","Group.1")
+chrY_data <-aggdata_genename[which(aggdata_genename$Group.1%in%chrYgenes$Group.1),]
+hc<-hclust(dist(t(chrY_data[,2:dim(chrY_data)[2]])), "ward.D2")
+x = cutree(hc,k=2)
+pdata2<-cbind(pdata,x)
+table(pdata2$Sex,pdata2$x)
+```
+
+No disconcordance has been observed. 
+
+2. Intensity distribution (red:Asthma and black:Healthy)  
+```{r density_ori,echo=FALSE,message=FALSE,fig.align="center",fig.width=8,fig.height=4}
+col<-as.numeric(pdata2$Condition)
+plot(density(aggdata_genename[,2]),col=col[1],ylim=c(0,0.3),main="")
+for(i in 3:dim(aggdata_genename)[2])
+  lines(density(aggdata_genename[,i]),col=col[i-1])
+```
+
+All samples have similar intensity distributions.
+
+### 1-3-2. Hierarchycal clustering analysis
+
+Light pink: healthy, light green: asthma
+```{r dendrogram_used, echo=FALSE,fig.align="center",fig.width=8,fig.height=4}
+t<-aggdata_genename[,2:dim(aggdata_genename)[2]]
+names(t)<-pdata2$Condition
+hc <- hclust(dist(t(t)), "ward.D2")
+dend <- as.dendrogram(hc)
+dend2 <- color_unique_labels(dend)
+par(cex=0.2)
+plot(dend2)
+```
+
+```{r cut_tree1,echo=FALSE,message=TRUE}
+x = paste("cluster_",cutree(hc,k=2),sep="")
+pdata2<-cbind(pdata,x)
+table(pdata2$Condition,pdata2$x,pdata2$Sex)
+```
+
+Two branches observed, but all conditions distributed in both branches.
+
+# 2. Cell subtype proportion from LM22
+Because U-BIO sample is whole blood, so we only used LM22 
+
+## 2-1. LM22 cibersort result
+```{r reading_LM22,echo=FALSE}
+cibersort1 <-read.csv("Asthma_CIBERSORT_LM22.csv",header=T)
+colnames(cibersort1)<-c("PatientID",colnames(cibersort1)[2:23])
+cibersort_used <-cibersort1[which(cibersort1$PatientID%in%colnames(aggdata_genename)),]
+cibersort1<-cibersort_used
+LM22 = cibersort1[,1:23]
+```
+
+## 2-2. Cell Proportion: Case vs. Control
+```{r boxplot_LM22, fig.align="center",fig.width=10,fig.height=6,echo=FALSE}
+pdata3 <-cbind(LM22,pdata2)
+#### plot cell proportion case vs. control
+LM22_cell = names(pdata3)[2:23]
+LM22_cell = c(LM22_cell[1:2],LM22_cell[4:22],LM22_cell[3])
+LM22_melt = melt(pdata3,id.vars = c("PatientID","Condition","Sex"),measure.vars = LM22_cell)
+
+col =  gg_color_hue(3)
+
+#quartz(w=8,h=6)
+cell_g = ggplot(LM22_melt,aes(x=variable,y=value,colour=Condition)) + geom_boxplot(outlier.alpha = 0,position = position_dodge(width=0.9), fill="white",size=0.3) 
+cell_g = cell_g + geom_point(position=position_jitterdodge(dodge.width=0.9,jitter.width=0.2),size=0.2,alpha=0.75) + ylim(0,1)
+cell_g = cell_g + theme_classic() + scale_x_discrete(limits=LM22_cell)
+cell_g = cell_g + scale_color_manual(values=col[c(3,1)])
+cell_g = cell_g + labs(x="LM22 Cell Type",y="Cell Proportion",title="UBIO LM22 Cell Proportion Control vs. Case")
+cell_g = cell_g + theme(legend.position = "bottom",
+                        axis.title = element_text(size=8,colour="black"),
+                        axis.text = element_text(size=8,colour="black",angle=0),
+                        axis.text.x = element_text(size=8,colour="black",angle=45,hjust=1,vjust=1),
+                        title = element_text(size=8))
+cell_g
+```
+
+## 2-3. Testing contributoin of other covairates to cell subtype proportions
+From the heatmap we could see that disease and sex are the strong contributors of cell subtype proportions.
+```{r pca_cell,echo=FALSE,fig.align="center",fig.width=8,fig.height=8}
+pca<-prcomp(t(LM22[,-1]))
+#save(pca,file="~/Documents/Grant/PBMC/GSE69683/pca_cibersort_LM22.Rdata")
+pdata<-cbind(pdata,LM22)
+status<-status.p<-c()
+for (i in seq(1:10)){
+  status<-pdata$Condition
+  status<-lm(pca$rotation[,i]~status)
+  status.p<-c(status.p, anova(status)$Pr[1])
+}
+
+Smoking<-Smoking.p<-c()
+for (i in seq(1:10)){
+  Smoking <-pdata$Smoking
+  Smoking<-lm(pca$rotation[,i]~Smoking)
+  Smoking.p<-c(Smoking.p, anova(Smoking)$Pr[1])
+}
+Sex<-Sex.p<-c()
+for (i in seq(1:10)){
+  Sex <-pdata$Sex
+  Sex<-lm(pca$rotation[,i]~Sex)
+  Sex.p<-c(Sex.p, anova(Sex)$Pr[1])
+}
+race<-race.p<-c()
+for (i in seq(1:10)){
+  race <-pdata$race
+  race<-lm(pca$rotation[,i]~race)
+  race.p<-c(race.p, anova(race)$Pr[1])
+}
+
+pvals.raw<-rbind(status.p,Sex.p,Smoking.p,race.p)
+pvals.raw<-data.matrix(pvals.raw)
+colnames(pvals.raw)<-c("PC 1", "PC 2", "PC 3", "PC 4", "PC 5", "PC 6", "PC 7", "PC 8", "PC 9", "PC 10")
+row.names(pvals.raw)<-c("Status","Sex","Smoking","Race")
+library(gplots)
+library(RColorBrewer)
+logpvals.raw<--log10(pvals.raw)
+
+hmcol2<-colorRampPalette(brewer.pal(9,"OrRd"))(500)
+heatmap.2(logpvals.raw, Rowv=FALSE, Colv=FALSE, dendrogram='none', trace='none', margins=c(10,8), col=hmcol2, 
+          colsep=c(1:10), rowsep=c(1:20), sepwidth=c(0.05, 0.025), sub="Cell Proportion PCs by Association with Known Covariates",
+          cexRow = 1)
+```
+
+
+#3. DEG Analysis
+
+## 3-1. DE Analysis Without Cell Proprotion Adjustment
+Although the authors adjusted for RIN (RNA quality), clinical site, and gender, the RIN and clinical site information is not available. Therefore, I only adjusted for gender.
+
+### 3-1-1. DE genes
+There are **405** DE genes when only adjusted for sex
+```{r DE sex,echo=FALSE,message=TRUE}
+pdata = pdata[,1:6]
+rownames(pdata) = pdata$sample_id
+# design matrix
+design_sex = model.matrix(~0 + Condition + Sex,data=pdata)
+colnames(design_sex) = c("Healthy","Severe_Asthma","Male")
+
+# fit the linear model
+rownames(aggdata_genename) = aggdata_genename[,1]
+aggdata_genename = aggdata_genename[,-1]
+all.equal(colnames(aggdata_genename),rownames(design_sex))
+fit_sex = lmFit(aggdata_genename,design_sex)
+
+# create contrast matrix
+contMatrix_sex = makeContrasts(Healthy-Severe_Asthma,
+                               levels=design_sex)
+fit2_sex = contrasts.fit(fit_sex,contMatrix_sex)
+fit2_sex = eBayes(fit2_sex)
+
+# toptable
+DE_sex = topTable(fit2_sex, coef=1, num=Inf)
+saveRDS(DE_sex,file="DE_sex.RDS")
+
+# get the significant DEs
+## adjust_p<=0.05 & log2 FC>1.2
+sig_sex = DE_sex[DE_sex$adj.P.Val<=0.05&abs(DE_sex$logFC)>=log2(1.2),]
+saveRDS(sig_sex,file="sig_DE_sex.RDS")
+```
+
+### 3-1-2 MA plot only adjusted for Sex
+```{r MA_before, echo=FALSE,fig.align="center",fig.width=6,fig.height=4}
+par(mfrow=c(1,1))
+plot(DE_sex$AveExpr,DE_sex$logFC,type="p",pch=20,cex=0.1,xlab="MA-plot (cont - case) without adjusment", ylab="logFC")
+points(sig_sex$AveExpr,sig_sex$logFC,pch=20,cex=0.5,col="red")
+```
+
+## 3-2 DE Analysis Ajusted by Cell Proportion (LM22)
+
+### 3-2-1. Cell Subtype Proportion Contributions to Expression Data
+
+```{r testing_cell_pro_cont,echo=FALSE,fig.align="center",fig.width=8,fig.height=6}
+pca_exp<-prcomp(aggdata_genename)
+pca_exp_res = pca_exp$rotation[,1:10]
+#save(pca, file="~/Documents/Grant/PBMC/GSE69683/pca_expression_log.Rdata")
+factor = c("Condition","Smoking","Sex","race",LM22_cell)
+
+covar_dat = cbind(LM22,pdata)
+
+###### Association 
+exp_pca_p = NULL
+exp_pca_r_sq = NULL
+for (sub_factor in factor){
+    sub_exp_pca_p = NULL
+    sub_exp_pca_r_sq = NULL
+    sub_factor_dat = covar_dat[,sub_factor]
+    for (pc in 1:10){
+        sub_pc = pca_exp_res[,pc]
+        
+        sub_lm = lm(sub_pc~sub_factor_dat)
+        
+        sub_r_sq = summary(sub_lm)$adj.r.squared
+        sub_p = summary(sub_lm)$coefficients[2,4]
+        
+        sub_exp_pca_p = c(sub_exp_pca_p,sub_p)
+        sub_exp_pca_r_sq = c(sub_exp_pca_r_sq,sub_r_sq)
+    }
+    exp_pca_p = cbind(exp_pca_p,sub_exp_pca_p)
+    exp_pca_r_sq = cbind(exp_pca_r_sq,sub_exp_pca_r_sq)
+}
+colnames(exp_pca_p) = factor
+rownames(exp_pca_p) = paste0("exp_",colnames(pca_exp_res)[1:10])
+colnames(exp_pca_r_sq) = factor
+rownames(exp_pca_r_sq) =  paste0("exp_",colnames(pca_exp_res)[1:10])
+
+pca_log_p = -log10(t(exp_pca_p))
+breaks = unique(c(seq(0,10,0.025),seq(10,92,1)))
+hmcol2<-colorRampPalette(brewer.pal(9,"BuGn"))(482)
+
+heatmap.2(pca_log_p, Rowv=FALSE, Colv=FALSE, dendrogram='none', trace='none', margins=c(8,12), keysize = 1.2,col=hmcol2, colsep=c(1:10), rowsep=c(1:20), 
+          sepwidth=c(0.05, 0.025),sub="Association between PC of Expression and Known Covariants",symm=F,symkey=F,symbreaks=F,breaks=breaks,cexCol = 0.75)
+```
+
+### 3-2-2. DE Model Ajust for Actuall Cell Proportions
+Adjust for all cell types **142** DE genes identified
+```{r loading_covariate, echo=FALSE,message=FALSE}
+## 1. Fit the LM model to find DMPs
+# design matrix
+design_cell_all = model.matrix(~0 + Condition + Sex 
+                               + B.cells.naive 
+                               + B.cells.memory
+                               + Plasma.cells
+                               + T.cells.CD8
+                               + T.cells.CD4.naive
+                               + T.cells.CD4.memory.resting
+                               + T.cells.CD4.memory.activated
+                               + T.cells.follicular.helper
+                               + T.cells.regulatory..Tregs.
+                               + T.cells.gamma.delta
+                               + NK.cells.resting
+                               + NK.cells.activated
+                               + Monocytes
+                               + Macrophages.M0
+                               + Macrophages.M1
+                               + Macrophages.M2
+                               + Dendritic.cells.resting
+                               + Dendritic.cells.activated
+                               + Mast.cells.resting
+                               + Mast.cells.activated
+                               + Eosinophils
+                               + Neutrophils
+                               ,data=covar_dat)
+colnames(design_cell_all)[1:3] = c("Healthy","Severe_Asthma","Male")
+
+# fit the linear model
+all.equal(colnames(aggdata_genename),rownames(design_cell_all))
+fit_cell_all = lmFit(aggdata_genename,design_cell_all)
+
+# create contrast matrix
+contMatrix_cell_all = makeContrasts(Healthy-Severe_Asthma,
+                                   levels=design_cell_all)
+fit2_cell_all = contrasts.fit(fit_cell_all,contMatrix_cell_all)
+fit2_cell_all = eBayes(fit2_cell_all)
+
+DE_cell_all = topTable(fit2_cell_all, coef=1, num=Inf)
+#saveRDS(DE_cell_all,file="DE_cell_all.RDS")
+
+# get the significant DEs
+sig_cell_all = DE_cell_all[DE_cell_all$adj.P.Val<=0.05&abs(DE_cell_all$logFC)>=log2(1.2),]
+saveRDS(sig_cell_all,file="sig_DEs_cell_all.RDS")
+```
+
+### 3-2-3 MA plot only adjusted for SexMA plot after the cell proportion adjustment.
+```{r MA_after, echo=FALSE,fig.align="center",fig.width=6,fig.height=4}
+plot(DE_cell_all$AveExpr,DE_cell_all$logFC,type="p",pch=20,cex=0.1,xlab="MA-plot (cont - case) after adjusment", ylab="logFC")
+points(sig_cell_all$AveExpr,sig_cell_all$logFC,pch=20,cex=0.5,col=2)
+```
+
+## 3-3 DE Analysis Ajusted by PCs of Cell Proportion (LM22)
+### 3-3-1. PCs of Cell Subtype Association with Expression Data
+
+```{r PCA heatmap PCs,echo=FALSE,fig.align="center",fig.width=8,fig.height=6}
+lm22_pca_res = lm22_pca$rotation[,1:10]
+
+###### Association 
+lm22_exp_pca_p = NULL
+lm22_exp_pca_r_sq = NULL
+for (i in 1:10){
+    sub_exp_pca_p = NULL
+    sub_exp_pca_r_sq = NULL
+    sub_lm22_pc = lm22_pca_res[,i]
+    for (pc in 1:10){
+        sub_pc = pca_exp_res[,pc]
+        
+        sub_lm = lm(sub_pc~sub_lm22_pc)
+        
+        sub_r_sq = summary(sub_lm)$adj.r.squared
+        sub_p = summary(sub_lm)$coefficients[2,4]
+        
+        sub_exp_pca_p = c(sub_exp_pca_p,sub_p)
+        sub_exp_pca_r_sq = c(sub_exp_pca_r_sq,sub_r_sq)
+    }
+    lm22_exp_pca_p = cbind(lm22_exp_pca_p,sub_exp_pca_p)
+    lm22_exp_pca_r_sq = cbind(lm22_exp_pca_r_sq,sub_exp_pca_r_sq)
+}
+colnames(lm22_exp_pca_p) = paste0("lm22_",colnames(lm22_pca_res))
+rownames(lm22_exp_pca_p) = paste0("exp_",colnames(pca_exp_res)[1:10])
+colnames(lm22_exp_pca_r_sq) = paste0("lm22_",colnames(lm22_pca_res))
+rownames(lm22_exp_pca_r_sq) =  paste0("exp_",colnames(pca_exp_res)[1:10])
+
+lm22_pca_log_p = -log10(t(lm22_exp_pca_p))
+breaks = unique(c(seq(0,10,0.025),seq(10,92,1)))
+hmcol2<-colorRampPalette(brewer.pal(9,"BuGn"))(482)
+
+heatmap.2(lm22_pca_log_p, Rowv=FALSE, Colv=FALSE, dendrogram='none', trace='none', margins=c(8,12), keysize = 1.2,col=hmcol2, colsep=c(1:10), rowsep=c(1:20), 
+          sepwidth=c(0.05, 0.025),sub="Association between PCs of Expression and PCs of LM22",symm=F,symkey=F,symbreaks=F,breaks=breaks,cexCol = 0.75)
+
+```
+
+### 3-3-2. DE Model Ajust for PCs of Cell Proportions
+Here we will use PCs with association with Exp data (p<0.01), and explains >0.1% of variantion of LM22 data  
+Under this criteria, PC1-PC7 are used in the model  
+**166** DE genes identified
+```{r DE PCs, echo=FALSE,message=FALSE}
+## 1. Fit the LM model to find DMPs
+# design matrix
+lm22_pc_dat = cbind(lm22_pca_res,pdata)
+rownames(lm22_pc_dat) = lm22_pc_dat$PatientID
+asso_lm22_max = apply(lm22_pca_log_p,1,max)
+which(asso_lm22_max>2&summary(lm22_pca)$importance[2,1:10]>0.001)
+
+design_cell_all_pc = model.matrix(~0 + Condition + Sex 
+                               + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7
+                               ,data=lm22_pc_dat)
+colnames(design_cell_all_pc)[1:3] = c("Healthy","Severe_Asthma","Male")
+
+# fit the linear model
+all.equal(colnames(aggdata_genename),rownames(design_cell_all_pc))
+fit_cell_all_pc = lmFit(aggdata_genename,design_cell_all_pc)
+
+# create contrast matrix
+contMatrix_cell_all_pc = makeContrasts(Healthy-Severe_Asthma,
+                                   levels=design_cell_all_pc)
+fit2_cell_all_pc = contrasts.fit(fit_cell_all_pc,contMatrix_cell_all_pc)
+fit2_cell_all_pc = eBayes(fit2_cell_all_pc)
+
+DE_cell_all_pc = topTable(fit2_cell_all_pc, coef=1, num=Inf)
+#saveRDS(DE_cell_all_pc,file="DE_cell_all_pc.RDS")
+
+# get the significant DEs
+sig_cell_all_pc = DE_cell_all_pc[DE_cell_all_pc$adj.P.Val<=0.05&abs(DE_cell_all_pc$logFC)>=log2(1.2),]
+saveRDS(sig_cell_all_pc,file="sig_DEs_cell_all_pc.RDS")
+```

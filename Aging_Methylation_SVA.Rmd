@@ -1,0 +1,343 @@
+---
+title: "Aging_SVA_Analysis"
+author: "Yu Kong and Masako Suzuki"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    css: template.css
+    toc: yes
+    toc_depth: 4
+  output: null
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  word_document: default
+---
+
+```{r packages,echo=FALSE, warning=FALSE, message = FALSE}
+library(gplots)
+library(RColorBrewer)
+library(dendextend)
+library(ggplot2)
+library(biomaRt)
+library(reshape2)
+library(limma)
+library(ggfortify)
+library(VennDiagram)
+library(GGally)
+library(grid)
+library(gridExtra)
+library(minfi)
+library("rtracklayer")
+library(lemon)
+options(stringsAsFactors = F)
+
+opts_chunk$set(dpi=150,
+               dev = c("png","pdf"),
+               fig.path="knitr_figures/",
+               fig.width=7, fig.height=7,
+               fig.align='center',
+               fig.pos='htbp', echo=FALSE,
+               cache=FALSE, message=FALSE,warning=FALSE)
+
+gg_color_hue <- function(n) {
+ hues = seq(15, 375, length = n + 1)
+ hcl(h = hues, l = 65, c = 100)[1:n]
+}
+```
+
+#1. Loding files
+```{r load data, echo=FALSE,message=TRUE}
+## raw methylation data before batch adjustment
+aging_GRSet_raw = readRDS("GRset_quantile_filtered.RDS")
+mVals_raw = getM(aging_GRSet_raw)
+bVals_raw = getBeta(aging_GRSet_raw)
+pdata = pData(aging_GRSet_raw)
+```
+
+## 1-1. Adjust data by batch effect
+```{r adj batch}
+# identify batch
+mds = plotMDS(getM(aging_GRSet_raw),top=1000, gene.selection = "common",
+        col=pal[as.factor(pData(GRset_quantile_f)$group)],cex = 0.8,main="after filtering (Status)")
+cmd = mds$cmdscale.out
+batch1 = rownames(cmd[cmd[,1]<=0.5&cmd[,2]>=0.01,])
+batch2 = rownames(cmd[cmd[,1]>0.5|cmd[,2]<0.01,])
+
+batch = rbind(data.frame(pid=batch1,batch=1),data.frame(pid=batch2,batch=2))
+rownames(batch) = batch$pid
+batch = batch[rownames(pdata),]
+all.equal(batch$pid,pdata$pid)
+pdata$batch = batch$batch
+pData(aging_GRSet_raw)$batch = batch$batch
+
+## correct batch
+modcombat = model.matrix(~1,data = pdata)
+combat_mVals = ComBat(dat=getM(aging_GRSet_raw),
+                      batch = pdata$batch,
+                      mod = modcombat)
+mod = model.matrix(~ group,data = pdata)
+mod0 = model.matrix(~1,data = pdata)
+pValuesComBat = f.pvalue(combat_mVals,mod,mod0)
+qValuesComBat = p.adjust(pValuesComBat,method="BH")
+
+combat_bVals = 2^combat_mVals/(2^combat_mVals+1)
+
+all.equal(colnames(combat_mVals),sampleNames(GRset_quantile_f))
+all.equal(rownames(combat_mVals),featureNames(GRset_quantile_f))
+aging_GRSet = GenomicRatioSet(gr=granges(GRset_quantile_f),
+                                  Beta = combat_bVals,
+                                  M = combat_mVals,
+                                  CN = getCN(GRset_quantile_f),
+                                  pData = pData(GRset_quantile_f),
+                                  annotation = annotation(GRset_quantile_f),
+                                  preprocessMethod = preprocessMethod(GRset_quantile_f))
+
+mVals = getM(aging_GRSet)
+bVals = getBeta(aging_GRSet)
+
+## cell proportion
+houseman = ("aging_cellprops.RDS")
+```
+
+## 1-2. Adjust data by cell proportions
+```{r adj cell prop pc}
+pca_methy = prcomp(t(mVals),scale. = T)
+pca_methy_res = pca_methy$x[,1:10]
+
+houseman_prop = houseman[,1:6]
+houseman_pca = prcomp(houseman_prop,scale=T)
+houseman_pca_res = houseman_pca$x
+
+all.equal(rownames(houseman_pca_res),rownames(pca_methy_res))
+
+houseman_meth_pca_p = NULL
+houseman_meth_pca_r_sq = NULL
+for (i in 1:6){
+    sub_pca_p = NULL
+    sub_pca_r_sq = NULL
+    sub_pc = paste0("PC",i)
+    sub_houseman_pc = houseman_pca_res[,sub_pc]
+    for (j in 1:10){
+        pc = paste0("PC",j)
+        sub_meth_pc = pca_methy_res[,pc]
+        
+        sub_lm = lm(sub_meth_pc~sub_houseman_pc)
+        
+        sub_r_sq = summary(sub_lm)$adj.r.squared
+        sub_p = summary(sub_lm)$coefficients[2,4]
+        
+        sub_pca_p = c(sub_pca_p,sub_p)
+        sub_pca_r_sq = c(sub_pca_r_sq,sub_r_sq)
+    }
+    houseman_meth_pca_p = cbind(houseman_meth_pca_p,sub_pca_p)
+    houseman_meth_pca_r_sq = cbind(houseman_meth_pca_r_sq,sub_pca_r_sq)
+}
+colnames(houseman_meth_pca_p) = paste0("houseman_pc",seq(1,6))
+rownames(houseman_meth_pca_p) = paste0("meth_pc",seq(1,10))
+colnames(houseman_meth_pca_r_sq) = paste0("houseman_pc",seq(1,6))
+rownames(houseman_meth_pca_r_sq) = paste0("meth_pc",seq(1,10))
+
+houseman_meth_pca_log_p = -log10(t(houseman_meth_pca_p))
+
+## adjust linear model by PCs
+houseman_pc_asso_max = apply(houseman_meth_pca_log_p,1,max)
+which(houseman_pc_asso_max>3&summary(houseman_pca)$importance[2,1:6]>0.05)
+design_houseman_pc = model.matrix(~0 + Status + Sex 
+                               + PC1 + PC2 + PC3 + PC5 
+                               ,data=houseman_pca_res)
+colnames(design_houseman_pc)[1:3] =c("nonagenarian","young","Male")
+
+
+# fit the linear model
+all.equal(colnames(mVals),rownames(design_houseman_pc))
+fit_DMP_houseman_pc = lmFit(mVals,design_houseman_pc)
+
+# create contrast matrix
+contMatrix_houseman_pc = makeContrasts(nonagenarian-young,
+                                levels=design_houseman_pc)
+
+fit2_DMP_houseman_pc = contrasts.fit(fit_DMP_houseman_pc,contMatrix_houseman_pc)
+fit2_DMP_houseman_pc = eBayes(fit2_DMP_houseman_pc)
+
+# toptable
+DMP_houseman_pc = topTable(fit2_DMP_houseman_pc, coef=1, num=Inf)
+# adjust beta values
+mVals_houseman_pc = mVals - (fit_DMP_houseman_pc$coef[,-c(1,2)] %*% t(design_houseman_pc[,-c(1,2)]))
+```
+
+#2. SVA analysis
+## 2-1. SVA on raw data
+```{r meth SVA raw,echo=FALSE,message=TRUE,fig.align="center",fig.width=10,fig.height=5}
+# identify svas
+mod <- model.matrix(~as.factor(Status), data=pdata)
+mod0 <- model.matrix(~1, data=pdata)
+meth.sva.results <- sva(mVals_raw, mod, mod0)
+saveRDS(meth.sva.results,"Methylation_Raw_Data_SVA_res.RDS")
+
+####################### association between methylation data and sva #####################
+meth_sva_res = meth.sva.results$sv
+rownames(meth_sva_res) = colnames(mVals_raw)
+colnames(meth_sva_res) = paste0("SV",seq(1:17))
+all.equal(rownames(pdata),rownames(meth_sva_res))
+####################### association between SVA and demographic factors #####################
+pheno = pData(aging_GRSet)[ov,]
+all.equal(rownames(pdata),rownames(pheno))
+pdata$batch = pheno$batch 
+methSV_houseman_p = NULL
+methSV_housemanr_sq = NULL
+factors = c(c("Status","Sex","cmv_serostatus","cf_dna","cmv_titer","batch"),colnames(houseman_prop))
+houseman = cbind(houseman_prop,pdata)
+for (sub_factor in factors){
+    tmp_factor = houseman[,sub_factor]
+    
+    tmp_p = apply(meth_sva_res,2,function(x)summary(lm(x~tmp_factor))$coef[2,4])
+    tmp_r_sq = apply(meth_sva_res,2,function(x)summary(lm(x~tmp_factor))$r.square)
+    
+    methSV_houseman_p = rbind(methSV_houseman_p,tmp_p)
+    methSV_housemanr_sq = rbind(methSV_housemanr_sq,tmp_r_sq)
+}
+rownames(methSV_houseman_p) = factors
+colnames(methSV_houseman_p) = paste0("SV",seq(1:17))
+rownames(methSV_housemanr_sq) = factors
+colnames(methSV_housemanr_sq) = paste0("SV",seq(1:17))
+
+methSV_houseman_log_p = -log10(methSV_houseman_p)
+label = ifelse(methSV_houseman_log_p>=-log10(0.05),signif(sqrt(methSV_housemanr_sq),2),"")
+
+col_pal =  colorRamp2(c(0,-log10(0.06),seq(-log10(0.05),max(as.vector(methSV_houseman_log_p)),length.out = 9)), c("gray95","gray95", brewer.pal(9,"BuGn")))
+h1 = Heatmap(methSV_houseman_log_p,
+            col = col_pal,
+            row_title = "Known Factors and Houseman Cell Proportion",
+            row_title_side = "left",
+            show_row_names = T,
+            column_title = "Aging: Association between SVA of Methylation and Known Factors",
+            column_title_gp = gpar(fontsize = 12,fontface="bold"),
+            column_title_side = "top",
+            cluster_rows =  F,
+            cluster_columns =  F,
+            row_names_gp = gpar(fontsize=10),
+            column_names_gp = gpar(fontsize=10),
+            rect_gp = gpar(col = "white", lwd = 2),
+            cell_fun = function(j,i,x,y,width,height,fill){
+                grid.text(label[i,j],x,y,gp=gpar(fontsize=12))
+            },
+            heatmap_legend_param = list(title = "-log10(P.Value)")
+)
+h1
+```
+
+
+## 2-2. SVA on Batch Adjusted Methylation Data
+```{r batch adj meth SVA,echo=FALSE,message=TRUE,fig.align="center",fig.width=10,fig.height=5}
+# identify svas
+mod <- model.matrix(~as.factor(Status), data=pdata)
+mod0 <- model.matrix(~1, data=pdata)
+meth.sva.results <- sva(mVals, mod, mod0)
+saveRDS(meth.sva.results,"Methylation_SVA_res.RDS")
+####################### association between expression data and sva #####################
+meth_sva_res = meth.sva.results$sv
+rownames(meth_sva_res) = colnames(mVals)
+colnames(meth_sva_res) = paste0("SV",seq(1:19))
+all.equal(rownames(pdata),rownames(meth_sva_res))
+####################### association between SVA and demographic factors #####################
+methSV_houseman_p = NULL
+methSV_housemanr_sq = NULL
+factors = c(c("Status","Sex","cmv_serostatus","cf_dna","cmv_titer"),colnames(houseman_prop))
+houseman = cbind(houseman_prop,pdata)
+for (sub_factor in factors){
+    tmp_factor = houseman[,sub_factor]
+    
+    tmp_p = apply(meth_sva_res,2,function(x)summary(lm(x~tmp_factor))$coef[2,4])
+    tmp_r_sq = apply(meth_sva_res,2,function(x)summary(lm(x~tmp_factor))$r.square)
+    
+    methSV_houseman_p = rbind(methSV_houseman_p,tmp_p)
+    methSV_housemanr_sq = rbind(methSV_housemanr_sq,tmp_r_sq)
+}
+rownames(methSV_houseman_p) = factors
+colnames(methSV_houseman_p) = paste0("SV",seq(1:19))
+rownames(methSV_housemanr_sq) = factors
+colnames(methSV_housemanr_sq) = paste0("SV",seq(1:19))
+
+methSV_houseman_log_p = -log10(methSV_houseman_p)
+label = ifelse(methSV_houseman_log_p>=-log10(0.05),signif(sqrt(methSV_housemanr_sq),2),"")
+
+col_pal =  colorRamp2(c(0,-log10(0.06),seq(-log10(0.05),max(as.vector(methSV_houseman_log_p)),length.out = 9)), c("gray95","gray95", brewer.pal(9,"BuGn")))
+h2 = Heatmap(methSV_houseman_log_p,
+            col = col_pal,
+            row_title = "Known Factors and Houseman Cell Proportion",
+            row_title_side = "left",
+            show_row_names = T,
+            column_title = "Aging: Association between SVA of Methylation and Known Factors",
+            column_title_gp = gpar(fontsize = 12,fontface="bold"),
+            column_title_side = "top",
+            cluster_rows =  F,
+            cluster_columns =  F,
+            row_names_gp = gpar(fontsize=10),
+            column_names_gp = gpar(fontsize=10),
+            rect_gp = gpar(col = "white", lwd = 2),
+            cell_fun = function(j,i,x,y,width,height,fill){
+                grid.text(label[i,j],x,y,gp=gpar(fontsize=12))
+            },
+            heatmap_legend_param = list(title = "-log10(P.Value)")
+)
+h2
+```
+
+## 2-3. SVA after Batch and Cellular Composition Adjustment
+```{r meth SVA after cell prop,echo=FALSE,message=TRUE,fig.align="center",fig.width=15,fig.height=5}
+# identify svas
+mod <- model.matrix(~as.factor(Status), data=pdata)
+mod0 <- model.matrix(~1, data=pdata)
+all.equal(colnames(mVals_houseman_pc),rownames(mod))
+meth.post.cell.sva.results <- sva(mVals_houseman_pc, mod, mod0)
+saveRDS(meth.post.cell.sva.results,"Methylation_SVA_post_Houseman_PC_res.RDS")
+
+####################### association between expression data and sva #####################
+meth_post_cell_sva_res = meth.post.cell.sva.results$sv
+rownames(meth_post_cell_sva_res) = colnames(mVals_houseman_pc)
+colnames(meth_post_cell_sva_res) = paste0("SV",seq(1:34))
+all.equal(rownames(pdata),rownames(meth_post_cell_sva_res))
+####################### association between SVA and demographic factors #####################
+methSV_post_cell_houseman_p = NULL
+methSV_post_cell_housemanr_sq = NULL
+factors = c(c("Status","Sex","cmv_serostatus","cf_dna","cmv_titer"),colnames(houseman_prop))
+houseman = cbind(houseman_prop,pdata)
+for (sub_factor in factors){
+    tmp_factor = houseman[,sub_factor]
+    
+    tmp_p = apply(meth_post_cell_sva_res,2,function(x)summary(lm(x~tmp_factor))$coef[2,4])
+    tmp_r_sq = apply(meth_post_cell_sva_res,2,function(x)summary(lm(x~tmp_factor))$r.square)
+    
+    methSV_post_cell_houseman_p = rbind(methSV_post_cell_houseman_p,tmp_p)
+    methSV_post_cell_housemanr_sq = rbind(methSV_post_cell_housemanr_sq,tmp_r_sq)
+}
+rownames(methSV_post_cell_houseman_p) = factors
+colnames(methSV_post_cell_houseman_p) = paste0("SV",seq(1:34))
+rownames(methSV_post_cell_housemanr_sq) = factors
+colnames(methSV_post_cell_housemanr_sq) = paste0("SV",seq(1:34))
+
+methSV_post_cell_houseman_log_p = -log10(methSV_post_cell_houseman_p)
+label = ifelse(methSV_post_cell_houseman_log_p>=-log10(0.05),signif(sqrt(methSV_post_cell_housemanr_sq),2),"")
+
+col_pal =  colorRamp2(c(0,-log10(0.06),seq(-log10(0.05),max(as.vector(methSV_post_cell_houseman_log_p)),length.out = 9)), c("gray95","gray95", brewer.pal(9,"BuGn")))
+h3 = Heatmap(methSV_post_cell_houseman_log_p,
+            col = col_pal,
+            row_title = "Known Factors and Houseman Cell Proportion",
+            row_title_side = "left",
+            show_row_names = T,
+            column_title = "Aging: Association between SVA of Houseman Cell Adjusted Methylation and Known Factors",
+            column_title_gp = gpar(fontsize = 12,fontface="bold"),
+            column_title_side = "top",
+            cluster_rows =  F,
+            cluster_columns =  F,
+            row_names_gp = gpar(fontsize=10),
+            column_names_gp = gpar(fontsize=10),
+            rect_gp = gpar(col = "white", lwd = 2),
+            cell_fun = function(j,i,x,y,width,height,fill){
+                grid.text(label[i,j],x,y,gp=gpar(fontsize=12))
+            },
+            heatmap_legend_param = list(title = "-log10(P.Value)")
+)
+h3
+```

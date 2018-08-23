@@ -1,0 +1,420 @@
+---
+title: "Lupus Gene Expression Data Analysis"
+author: "Yu Kong and Masako Suzuki"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    css: template.css
+    toc: yes
+    toc_depth: 4
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  word_document: default
+---
+
+```{r packages,echo=FALSE, warning=FALSE, message = FALSE}
+library(gplots)
+library(RColorBrewer)
+library(dendextend)
+library(ggplot2)
+library(biomaRt)
+library(reshape2)
+library(limma)
+library(GGally)
+library(grid)
+library(gridExtra)
+library("goseq")
+library("rtracklayer")
+options(stringsAsFactors = F)
+
+opts_chunk$set(dpi=150,
+               dev = c("png","pdf"),
+               fig.path="knitr_figures/",
+               fig.width=7, fig.height=7,
+               fig.align='center',
+               fig.pos='htbp', echo=FALSE,
+               cache=FALSE, message=FALSE,warning=FALSE)
+```
+
+The GEO number of this data is # GSE81622
+
+
+Summary：	Our study has demonstrated that significant number of differential genes in SLE was involved in IFN, TLR signaling pathways and inflammatory cytokines. The enrichment of differential genes has been associated with aberrant DNA methylation, which may be relevant to the pathogenesis of SLE. Our observations laid the groundwork for further diagnostic and mechanistic studies of SLE and LN.
+ 	
+Overall design：	We performed whole genome transcription and DNA methylation analysis in PBMC of 30 SLE patients, including 15 with LN (SLE LN+) and 15 without LN (SLE LN-), and 25 normal controls (NC) using HumanHT-12 Beadchips and Illumina Human Methy450 chips. The serum pro-inflammatory cytokines were quantified using Bio-plex human cytokine 27-plex assay.
+
+Cell type: peripheral blood mononuclear cell (PBMC)
+RNA extraction: Total RNA was isolated from PBMC by standard phenol–chloroform extraction using Trizol reagent (Invitrogen Life Technologies, Carlsbad, CA) according to the manufacturer's instructions
+
+Sample_data_processing: 	"The data were normalised using quantile normalisation with Genespring software"
+
+
+# 1. Data Processing
+
+Obtain gene information from GPL10558-50081.
+```{r loading, echo=FALSE}
+data<-read.csv("GSE81622_series_matrix.csv",sep=",",header=T)
+ILEdata <-read.table("GPL10558-50081.csv",sep=",",header=T)
+colnames(ILEdata)<-c("ID_REF",colnames(ILEdata)[2:5])
+data_id <-merge(ILEdata,data,by="ID_REF")
+data_id<-data_id[which(data_id$Symbol!="NA"),]
+data_id<-data_id[which(data_id$Symbol!=""),] # eliminate if the gene doesn't have offical gene symbol# 
+```
+
+We have:
+```{r counting_original, echo=FALSE,message=TRUE}
+paste("Number of transcript = ",dim(data_id)[1],sep="")
+paste("Number of sample = ",dim(data_id)[2]-5,sep="")
+```
+
+Aggregate expression profile by gene name.
+
+We have
+```{r aggregate,echo=FALSE,message=TRUE}
+exp <-data_id[,5:60]
+SYMBOL<-exp$Symbol
+aggdata_genename <-aggregate(exp[,2:56], by=list(SYMBOL), 
+                             FUN=mean, na.rm=TRUE) ## calculate mean value per gene (by gene name)
+paste("Number of transcript = ",dim(aggdata_genename)[1],sep="")
+paste("Number of sample = ",dim(aggdata_genename)[2]-5,sep="")
+write.table(aggdata_genename,file="exp_status_byGene.txt",row.names = F,col.names = T,sep="\t",quote = F)
+#aggdata_genename<-read.table(file="exp_status_byGene.txt",header=T,sep="\t")
+paste("Number of transcript = ",dim(aggdata_genename)[1],sep="")
+paste("Number of sample = ",dim(aggdata_genename)[2]-5,sep="")
+
+```
+
+##QC
+checking sex information on GEO spread sheet and chr Y gene expression status
+```{r chrY, echo=FALSE,message=TRUE,fig.align="center",fig.width=6,fig.height=4}
+pdata <- read.table("pdata.csv",sep="\t",header=T)
+chrYgenes<-read.csv("chrY_genes",sep="\t")
+colnames(chrYgenes)<-c("chr","ILMN_Gene")
+chrY_data <-data_id[which(data_id$ILMN_Gene%in%chrYgenes$ILMN_Gene),6:60]
+names(chrY_data)<-paste(pdata$Sex,pdata$Status,sep="_")
+hc<-hclust(dist(t(log(chrY_data+0.001))), "ward.D2")
+dend <- as.dendrogram(hc)
+dend2 <- color_unique_labels(dend)
+par(cex=0.4)
+plot(dend2)
+x = cutree(hc,k=2)
+```
+
+### Eliminate some samples form the analysis
+since several samples have been switched (identified by sex), we decided to eliminate male and SLE+Lupus group.
+At this step, we have;
+```{r selection,echo=FALSE,message=TRUE}
+used <-which(pdata$Sex=="Female"&(pdata$Status=="SLE"|pdata$Status=="Healthy"))
+paste("number of sample = ",length(used),sep="")
+#[1] 33
+pdata_used <-pdata[used,]
+aggdata_genename_used <-aggdata_genename[,which(colnames(aggdata_genename)%in%pdata_used$X.Sample_geo_accession)]
+row.names(aggdata_genename_used)<-aggdata_genename[,1]
+```
+
+#2. Cell subtype proportion
+
+## 2-1. LM22
+
+### 2-1-1. LM22 cibersort result
+```{r reading_LM22,echo=FALSE}
+cibersort1 <-read.csv("LUPUS_CIBERSORT_LM22.csv",header=T)
+colnames(cibersort1)<-c("PatientID",colnames(cibersort1)[2:23])
+cibersort_used <-cibersort1[which(cibersort1$PatientI%in%pdata_used$X.Sample_geo_accession),]
+cibersort_used = cibersort_used[,c(1:23)]
+rownames(cibersort_used) = cibersort_used$PatientID
+rownames(pdata_used) = pdata_used$X.Sample_geo_accession
+pdata = pdata_used
+```
+
+```{r boxplot_LM22, fig.align="center",fig.width=6,fig.height=4,echo=FALSE}
+all.equal(rownames(cibersort_used),rownames(pdata_used))
+LM22 <-cbind(cibersort_used,pdata_used)
+
+LM22_melt = melt(LM22)
+LM22_melt$Case_control = gsub("Case","lupus",LM22_melt$Case_control)
+LM22_cell = names(LM22)[2:23]
+LM22_cell = c(LM22_cell[1:2],LM22_cell[4:22],LM22_cell[3])
+
+gg_color_hue <- function(n) {
+ hues = seq(15, 375, length = n + 1)
+ hcl(h = hues, l = 65, c = 100)[1:n]
+}
+col =  gg_color_hue(3)
+
+cell_g = ggplot(LM22_melt,aes(x=variable,y=value,colour=Case_control)) + geom_boxplot(outlier.alpha = 0,position = position_dodge(width=0.9), fill="white",size=0.3) 
+cell_g = cell_g + geom_point(position=position_jitterdodge(dodge.width=0.9,jitter.width=0.2),size=0.5,alpha=0.85) + ylim(0,1)
+cell_g = cell_g + theme_classic() + scale_x_discrete(limits=LM22_cell)
+cell_g = cell_g + scale_color_manual(values=col[c(3,1)])
+cell_g = cell_g + labs(x="LM22 Cell Type",y="Cell Proportion",title="Lupus LM22 Cell Proportion Control vs. Case")
+cell_g = cell_g + theme(legend.position = "bottom",
+                        axis.title = element_text(size=14,colour="black"),
+                        axis.text = element_text(size=14,colour="black",angle=0),
+                        axis.text.x = element_text(size=14,colour="black",angle=45,hjust=1,vjust=1),
+                        plot.title = element_text(size=16))
+cell_g
+```
+
+The disease status affects cell type proportion
+
+### 2-1-2. Association between LM22 Cell Proportion and other Factors
+```{r pca_cell,echo=FALSE,fig.align="center",fig.width=6,fig.height=2.5}
+pca_lm22 <-prcomp(t(cibersort_used[,2:23]))
+pca_lm22_res = pca_lm22$rotation[,1:10]
+
+all.equal(rownames(pca_lm22_res),rownames(pdata))
+pca_lm22_res = data.frame(pca_lm22_res,pdata)
+demo = c("Case_control","Age")
+
+###### Association 
+demo_p = NULL
+demo_r_sq = NULL
+for (sub_demo in demo){
+    sub_demo_p = NULL
+    sub_demo_r_sq = NULL
+    sub_demo_dat = pca_lm22_res[,sub_demo]
+    for (pc in 1:10){
+        sub_pc = pca_lm22_res[,pc]
+        
+        sub_lm = lm(sub_pc~sub_demo_dat)
+        
+        sub_r_sq = summary(sub_lm)$adj.r.squared
+        sub_p = summary(sub_lm)$coefficients[2,4]
+        
+        sub_demo_p = c(sub_demo_p,sub_p)
+        sub_demo_r_sq = c(sub_demo_r_sq,sub_r_sq)
+    }
+    demo_p = cbind(demo_p,sub_demo_p)
+    demo_r_sq = cbind(demo_r_sq,sub_demo_r_sq)
+}
+colnames(demo_p) = demo
+rownames(demo_p) = colnames(pca_lm22_res)[1:10]
+colnames(demo_r_sq) = demo
+rownames(demo_r_sq) = colnames(pca_lm22_res)[1:10]
+
+demo_log_p = -log10(t(demo_p))
+
+hmcol2<-colorRampPalette(brewer.pal(9,"OrRd"))(482)
+heatmap.2(demo_log_p, Rowv=FALSE, Colv=FALSE, dendrogram='none', trace='none', margins=c(10,10), col=hmcol2, colsep=c(1:10), rowsep=c(1:20), sepwidth=c(0.05, 0.025),sub="Association between PCs of LM22 and Known Covariants",cexRow = 1)
+
+```
+
+### 2-1-3.Association between LM22 Cell Proportion and PCs of Expression Data
+
+```{r testing_cell_pro_cont,echo=FALSE,fig.align="center",fig.width=5,fig.height=6}
+exp_pca<-prcomp(log(aggdata_genename_used+0.01))
+exp_pca_res = exp_pca$rotation[,1:10]
+all.equal(rownames(exp_pca_res),rownames(cibersort_used))
+all.equal(rownames(pdata),rownames(cibersort_used))
+lm22_exp_pca_res = data.frame(exp_pca_res,cibersort_used,pdata)
+
+factor = c("Case_control","Age","B.cells.naive","B.cells.memory","Plasma.cells","T.cells.CD8","T.cells.CD4.naive",
+           "T.cells.CD4.memory.resting","T.cells.CD4.memory.activated","T.cells.regulatory..Tregs.",
+           "T.cells.gamma.delta","NK.cells.resting","NK.cells.activated","Monocytes","Macrophages.M0",
+           "Macrophages.M2","Dendritic.cells.activated","Mast.cells.resting","Neutrophils")
+
+###### Association 
+lm22_exp_pca_p = NULL
+lm22_exp_pca_r_sq = NULL
+for (sub_factor in factor){
+    sub_exp_pca_p = NULL
+    sub_exp_pca_r_sq = NULL
+    sub_factor_dat = lm22_exp_pca_res[,sub_factor]
+    for (pc in 1:10){
+        sub_pc = lm22_exp_pca_res[,pc]
+        
+        sub_lm = lm(sub_pc~sub_factor_dat)
+        
+        sub_r_sq = summary(sub_lm)$adj.r.squared
+        sub_p = summary(sub_lm)$coefficients[2,4]
+        
+        sub_exp_pca_p = c(sub_exp_pca_p,sub_p)
+        sub_exp_pca_r_sq = c(sub_exp_pca_r_sq,sub_r_sq)
+    }
+    lm22_exp_pca_p = cbind(lm22_exp_pca_p,sub_exp_pca_p)
+    lm22_exp_pca_r_sq = cbind(lm22_exp_pca_r_sq,sub_exp_pca_r_sq)
+}
+colnames(lm22_exp_pca_p) = factor
+rownames(lm22_exp_pca_p) = paste0("exp_",colnames(lm22_exp_pca_res)[1:10])
+colnames(lm22_exp_pca_r_sq) = factor
+rownames(lm22_exp_pca_r_sq) = paste0("exp_",colnames(lm22_exp_pca_res)[1:10])
+
+lm22_exp_pca_log_p = -log10(t(lm22_exp_pca_p))
+
+breaks = unique(c(seq(0,10,0.025),seq(10,92,1)))
+hmcol2<-colorRampPalette(brewer.pal(9,"BuGn"))(482)
+heatmap.2(lm22_exp_pca_log_p, Rowv=FALSE, Colv=FALSE, dendrogram='none', trace='none', margins=c(10,8), col=hmcol2[1:which(breaks==round(max(lm22_exp_pca_log_p)))-1],
+          colsep=c(1:10), rowsep=c(1:20), sepwidth=c(0.05, 0.025),sub="Association between PCs of Exp and LM22",
+          symm=F,symkey=F,symbreaks=F,breaks=breaks[1:which(breaks==round(max(lm22_exp_pca_log_p)))],cexCol = 1)
+```
+
+### 2-1-4.Association between PCs of LM22 and PCs of Expression Data
+```{r PC associateion LM22 vs Exp, fig.align="center",fig.width=6,fig.height=6,echo=FALSE,message=FALSE}
+all.equal(rownames(pca_lm22_res),rownames(exp_pca_res))
+
+lm22_pca_p = NULL
+lm22_pca_r_sq = NULL
+for (i in 1:10){
+    sub_pca_p = NULL
+    sub_pca_r_sq = NULL
+    sub_lm22_pc = pca_lm22_res[,i]
+    for (pc in 1:10){
+        sub_exp_pc = exp_pca_res[,pc]
+        
+        sub_lm = lm(sub_exp_pc~sub_lm22_pc)
+        
+        sub_r_sq = summary(sub_lm)$adj.r.squared
+        sub_p = summary(sub_lm)$coefficients[2,4]
+        
+        sub_pca_p = c(sub_pca_p,sub_p)
+        sub_pca_r_sq = c(sub_pca_r_sq,sub_r_sq)
+    }
+    lm22_pca_p = cbind(lm22_pca_p,sub_pca_p)
+    lm22_pca_r_sq = cbind(lm22_pca_r_sq,sub_pca_r_sq)
+}
+colnames(lm22_pca_p) = paste0("lm22_pc",seq(1,10))
+rownames(lm22_pca_p) = paste0("exp_pc",seq(1,10))
+colnames(lm22_pca_r_sq) = paste0("lm22_pc",seq(1,10))
+rownames(lm22_pca_r_sq) = paste0("exp_pc",seq(1,10))
+
+lm22_pca_log_p = -log10(t(lm22_pca_p))
+
+breaks = unique(c(seq(0,10,0.025),seq(10,92,1)))
+hmcol2<-colorRampPalette(brewer.pal(9,"BuGn"))(482)
+heatmap.2(lm22_pca_log_p, Rowv=FALSE, Colv=FALSE, dendrogram='none', trace='none', margins=c(10,10), col=hmcol2[1:which(breaks==round(max(lm22_pca_log_p)))-1],
+          colsep=c(1:10), rowsep=c(1:20), sepwidth=c(0.05, 0.025),sub="Association between PCs of Expression and PCs of LM22",
+          symm=F,symkey=F,symbreaks=F,breaks=breaks[1:which(breaks==round(max(lm22_pca_log_p)))],cexRow = 0.8,cexCol = 0.8)
+```
+
+#3. DE analysis 
+
+## 3-1. No Adjustment
+**462** DE identified
+```{r DE no adj,echo=FALSE,message=TRUE}
+# design matrix
+design_no_correct = model.matrix(~0 + Case_control,data=pdata)
+colnames(design_no_correct) = c("Case","Control")
+
+exp_log = log(aggdata_genename_used+0.01)
+# fit the linear model
+all.equal(colnames(exp_log),rownames(design_no_correct))
+fit = lmFit(exp_log,design_no_correct)
+
+# create contrast matrix
+contMatrix_no_correct = makeContrasts(Case-Control,
+                                      levels=design_no_correct)
+fit2 = contrasts.fit(fit,contMatrix_no_correct)
+fit2 = eBayes(fit2)
+# toptable
+DE_no_correct = topTable(fit2, coef=1, num=Inf)
+saveRDS(DE_no_correct,file="/Volumes/home/ykong/PBMC/lupus_exp/DE_no_correct.RDS")
+
+# get the significant DEs
+## adjust_p<=0.05 & logFC>log(1.2)
+sig_no_correct = DE_no_correct[DE_no_correct$adj.P.Val<0.05&abs(DE_no_correct$logFC)>log2(1.2),]
+```
+
+## 3-2. Only control for age
+**485** DE identified
+```{r DE age,echo=FALSE,message=TRUE}
+# design matrix
+design_age = model.matrix(~0 + Case_control + Age,data=pdata)
+colnames(design_age) = c("Case","Control","Age")
+
+exp_log = log(aggdata_genename_used+0.01)
+# fit the linear model
+all.equal(colnames(exp_log),rownames(design_age))
+fit_age = lmFit(exp_log,design_age)
+
+# create contrast matrix
+contMatrix_age = makeContrasts(Case-Control,
+                                      levels=design_age)
+fit2_age = contrasts.fit(fit_age,contMatrix_age)
+fit2_age = eBayes(fit2_age)
+# toptable
+DE_age = topTable(fit2_age, coef=1, num=Inf)
+saveRDS(DE_age,file="/Volumes/home/ykong/PBMC/lupus_exp/DE_age.RDS")
+
+# get the significant DEs
+## adjust_p<=0.05 & logFC>log(1.2)
+sig_age = DE_age[DE_age$adj.P.Val<0.05&abs(DE_age$logFC)>log2(1.2),]
+```
+
+## 3-3. DE: Control for LM22 
+
+### 3-3-1. Adjust by LM22 Actual Cell Proportion
+Select cell types which average proportion is greater than 5% (adjusting all cell types didn't give us any significant genes)
+These cell types will be incude for adjustment\
+Only **4** DE identified 
+```{r proportion test,echo=FALSE,message=TRUE}
+which(apply(LM22[,2:23],2,mean)>0.05)
+design_lm22 = model.matrix(~0 + Case_control + Age 
+                           #+B.cells.memory
+                       #+ B.cells.naive
+                       #+ Dendritic.cells.activated
+                       #+ Dendritic.cells.resting
+                       #+ Eosinophils
+                       #+ Macrophages.M0
+                       #+ Macrophages.M1
+                       #+ Macrophages.M2
+                       #+ Mast.cells.activated
+                       #+ Mast.cells.resting
+                       + Monocytes
+                       #+ Neutrophils
+                       #+ NK.cells.activated
+                       + NK.cells.resting
+                       #+ Plasma.cells
+                       #+ T.cells.CD4.memory.activated
+                       + T.cells.CD4.memory.resting
+                       #+ T.cells.CD4.naive
+                       + T.cells.CD8
+                       #+ T.cells.follicular.helper
+                       #+ T.cells.gamma.delta
+                       #+ T.cells.regulatory..Tregs.
+                       ,data=LM22)
+colnames(design_lm22)[1:3] = c("Case","Control","Age")
+
+# fit the linear model
+all.equal(colnames(exp_log),rownames(design_lm22))
+fit_lm22 = lmFit(exp_log,design_lm22)
+
+# create contrast matrix
+contMatrix_lm22 = makeContrasts(Case-Control,
+                                levels=design_lm22)
+fit2_lm22 = contrasts.fit(fit_lm22,contMatrix_lm22)
+fit2_lm22 = eBayes(fit2_lm22)
+
+DE_lm22 = topTable(fit2_lm22, coef=1, num=Inf)
+saveRDS(DE_lm22,file="/Volumes/home/ykong/PBMC/lupus_exp/DE_lm22.RDS")
+# get the significant DEs
+sig_lm22 = DE_lm22[DE_lm22$adj.P.Val<0.05&abs(DE_lm22$logFC)>log2(1.2),]
+sig_lm22
+```
+
+
+### 3-3-2. PCs of LM22 cell proportion adjustment 
+We will use PCs with association p<0.01 and takes >1% variation  
+PC1,PC2,PC3,PC5 will be used according to criteria above.  
+Only **1** DE identified when model with PC.
+```{r PCs of proportion test,echo=FALSE,message=TRUE}
+lm22_pc_asso_max = apply(lm22_pca_log_p,1,max)
+which(lm22_pc_asso_max>2&summary(pca_lm22)$importance[2,1:10]>0.01)
+design_lm22_pc = model.matrix(~0 + Case_control + Age + PC1 + PC2 + PC3 + PC5 ,data=pca_lm22_res)
+colnames(design_lm22_pc)[1:3] = c("Case","Control","Age")
+
+# fit the linear model
+all.equal(colnames(exp_log),rownames(design_lm22_pc))
+fit_lm22_pc = lmFit(exp_log,design_lm22_pc)
+
+# create contrast matrix
+contMatrix_lm22_pc = makeContrasts(Case-Control,
+                                levels=design_lm22_pc)
+fit2_lm22_pc = contrasts.fit(fit_lm22_pc,contMatrix_lm22_pc)
+fit2_lm22_pc = eBayes(fit2_lm22_pc)
+
+DE_lm22_pc = topTable(fit2_lm22_pc, coef=1, num=Inf)
+saveRDS(DE_lm22_pc,file="/Volumes/home/ykong/PBMC/lupus_exp/DE_lm22_pc.RDS")
+# get the significant DEs
+sig_lm22_pc = DE_lm22_pc[DE_lm22_pc$adj.P.Val<0.05&abs(DE_lm22_pc$logFC)>log2(1.2),]
+```

@@ -1,0 +1,777 @@
+---
+title: "Lupus Methylation (450K) Data Analysis"
+author: "Yu Kong and Masako Suzuki"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  word_document: default
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  html_document:
+    css: template.css
+    toc: yes
+    toc_depth: 4
+---
+
+```{r options, echo=FALSE, warning=FALSE, message = FALSE}
+library("rmarkdown")
+library("knitr")
+library("ggplot2")
+library("minfi")
+library("GenomicRanges")
+library("reshape2")
+library("limma")
+library("RColorBrewer")
+library("gridExtra")
+library("GEOquery")
+library("grid")
+library("GGally")
+#library("DMRcate")
+library("rtracklayer")
+library("circlize")
+library("FlowSorted.Blood.450k")
+library("IlluminaHumanMethylation450kmanifest")
+library("IlluminaHumanMethylation450kanno.ilmn12.hg19")
+options(stringsAsFactors = F)
+
+opts_chunk$set(dpi=150,
+               dev = c("png","pdf"),
+               fig.path="knitr_figures/",
+               fig.width=7, fig.height=7,
+               fig.align='center',
+               fig.pos='htbp', echo=FALSE,
+               cache=FALSE, message=FALSE,warning=FALSE)
+```
+
+# 1. Read Raw Data
+
+1. Get raw methylation value from GEO: because the GEO accession only contain a raw count table (GSE82218_non-normalized.txt), we have to create MSet from the table
+2. Get phenotype data from the GEO: GSE82218_family.soft
+
+```{r read data}
+# read raw table
+raw = read.table("methylation/GSE82218_non-normalized.txt",sep="\t",header=T)
+rownames(raw) = raw$ID_REF
+
+unmethy = raw[,seq(3,166,3)]
+methy = raw[,seq(2,166,3)]
+detect_p = raw[,seq(4,166,3)]
+
+names(unmethy) = gsub(".Unmethylated.Signal","",names(unmethy))
+names(methy) = gsub(".Methylated.Signal","",names(methy))
+names(detect_p) = gsub(".Detection.Pval","",names(detect_p))
+
+names(unmethy) = gsub("\\.","_",names(unmethy))
+names(methy) = gsub("\\.","_",names(methy))
+names(detect_p) = gsub("\\.","_",names(detect_p))
+
+all.equal(names(unmethy),names(methy))
+all.equal(names(detect_p),names(methy))
+
+## phenodata
+geo = getGEO(filename="methylation/GSE82218_family.soft",GSEMatrix=T)
+sample_info = sapply(GSMList(geo),function(x)Meta(x)$characteristics_ch1)
+sample_title = sapply(GSMList(geo),function(x)Meta(x)$title)
+sample_info = data.frame(t(sample_info))
+sample_info$X1 = sapply(as.character(sample_info$X1),function(x)strsplit(x,": ",fixed = T)[[1]][2])
+sample_info$X2 = sapply(as.character(sample_info$X2),function(x)strsplit(x,": ",fixed = T)[[1]][2])
+sample_info$X3 = sapply(as.character(sample_info$X3),function(x)strsplit(x,": ",fixed = T)[[1]][2])
+sample_info$X3 = gsub("y","",sample_info$X3)
+sample_info$GSM = rownames(sample_info)
+
+sample_title_short = sapply(sample_title,function(x)strsplit(x,"[",fixed=T)[[1]][2])
+sample_title_short = substr(sample_title_short,1,nchar(sample_title_short)-1)
+all.equal(sample_info$GSM,names(sample_title_short))
+sample_title_short = gsub("SLE","SLE_",sample_title_short)
+sample_title_short = gsub("\\+LN","LN_",sample_title_short)
+all.equal(unname(sample_title_short),colnames(methy))
+sample_info$ID = sample_title_short
+condition = c(rep("NC",25),rep("SLE_LN_negative",15),rep("SLE_LN_positive",15))
+sample_info$condition = condition
+
+names(sample_info) = c("source","sex","age","GSM","ID","condition")
+
+# order pheno data for the same order as methy data
+all.equal(sample_info$ID,colnames(methy))
+all.equal(sample_info$ID,colnames(unmethy))
+all.equal(sample_info$ID,colnames(detect_p))
+colnames(methy) = sample_info$GSM
+colnames(unmethy) = sample_info$GSM
+colnames(detect_p) = sample_info$GSM
+
+pheno = AnnotatedDataFrame(sample_info)
+
+## create MSet for data
+MSet = MethylSet(Meth = as.matrix(methy),
+                 Unmeth = as.matrix(unmethy),
+                 phenoData = pheno)
+
+## save MSet
+saveRDS(MSet, file="MSet_new.RDS")
+RSet = ratioConvert(MSet, what = "both", keepCN = TRUE)
+GRSet = mapToGenome(RSet)
+saveRDS(RSet, file="RSet.RDS")
+saveRDS(GRSet, file="GRSet.RDS")
+saveRDS(detect_p,file="detect_p.RDS")
+```
+
+# 2. Quality Control
+
+## 2-1. Detection P value for each sample
+
+From the plot we could see that there is no sample has unusual high detection P value. So we will not remove any sample at this stage.
+```{r p value,fig.align="center",fig.width=8,fig.height=4,echo=FALSE}
+p_mean = apply(detect_p,2,function(x)mean(x,na.rm=T))
+p_mean = data.frame(ID=names(p_mean),average_detect_p = p_mean)
+
+g = ggplot(p_mean,aes(x=ID,y=average_detect_p)) + geom_bar(stat = "identity",alpha=0.75)
+g = g + theme_classic() + labs(x="ID",y="average detection p value",title="QC-detection p")
+g = g + theme(axis.title = element_text(size=8,colour="black"),
+              axis.text.x = element_text(size=6,colour="black",angle=45,hjust=1,vjust=1),
+              axis.text.y = element_text(size=8,colour="black",angle=0),
+              title = element_text(size=8))
+g
+```
+
+## 2-2. Other QC plots
+
+```{r QC plot,fig.align="center",fig.width=4,fig.height=4,echo=FALSE}
+qc = getQC(MSet)
+
+# QC plot
+plotQC(qc)
+
+# Sex prediction
+predictedSex <- getSex(GRSet, cutoff = -2)$predictedSex
+predictedSex = ifelse(predictedSex=="F","Female","Male")
+#all.equal(predictedSex,pheno$sex)
+pheno$predictedSex = predictedSex
+
+pheno[which(pheno$predictedSex!=pheno$sex),]
+```
+
+## 2-3 Sex Mislabeled Samples
+From the sex prediction here, we observed that the **sex for 4 samples might be mislabeled**. In order to not affect our further analysis, we decided to drop these samples.
+The sample groups are:
+```{r sample info kable,echo=FALSE}
+sample = data.frame(condition=c("NC","SLE-LN-","SLE-LN+"),
+                    nSample = c("25 (F20,M5)","15 (F13,M2)","15(F13,M2"),
+                    mislabeled_sex=c("0","0","4 (F2,M2)"))
+kable(sample,caption="Sample Group",align = c("c","c","c"))
+```
+
+From RNA-seq data, 1 Male sample in SLE-LN- is estimated as female. So we finally decided to **drop samples**:
+1. Samples in SLE-LN+ group, we are only comparing NC vs. SLE-LN- for simplicity  
+2. All male samples, because there are only 7 males in NC (n=5) and SLE-LN- (n=2)
+
+So here is the new group information
+```{r drop sample, echo=FALSE}
+keep = which(pheno$sex=="Female"&pheno$condition!="SLE_LN_positive")
+MSet_f = MSet[,keep]
+pheno = pheno[keep,]
+MSet = MSet_f
+MSet
+saveRDS(MSet,file="MSet_33sample.RDS")
+```
+
+```{r kable new, echo=FALSE}
+sample = data.frame(condition=unique(pheno$condition),
+                    nSample = c(sum(pheno$condition=="NC"),sum(pheno$condition=="SLE_LN_negative")),
+                    sex=c("All Female","All Female"))
+kable(sample,caption="New Sample Group",align = c("c","c","c"))
+```
+
+# 3. Normalization
+
+Because there is no previous knowledge about global differences in the methylation status in disease and control, we will use `processQuantile` function to normalize the data, as instructed by the `minfi` R package
+
+```{r normalization,echo=FALSE,message=FALSE,warning=FALSE,fig.align="center",fig.width=8,fig.height=4}
+a = c(rg.norm="Raw (no normalization or bg correction)", minfi = "1.16.1", manifest = "0.4.0")
+MSet@preprocessMethod = a
+
+GRset_quantile = preprocessQuantile(MSet)
+
+## visualize before and after normalization
+par(mfrow=c(1,2))
+densityPlot(MSet, sampGroups = pData(MSet)$condition,main="Raw")
+densityPlot(getBeta(GRset_quantile), 
+            sampGroups = pData(GRset_quantile)$condition,main="preprocessQuantile")
+```
+
+# 4. MDS
+From MDS, we didn't observe any outlier sample. So we will not further filter samples.
+```{r MDS,fig.align="center",fig.width=4,fig.height=4,echo=FALSE,message=FALSE}
+pal = brewer.pal(8,"Dark2")
+plotMDS(getM(GRset_quantile),top=1000, gene.selection = "common",
+        col=pal[as.factor(pData(GRset_quantile)$condition)],cex = 0.8,main="before filtering (Status)")
+# no huge outliers, so we will keep all the sample at this stage.
+```
+
+# 5. Filtering Probes
+
+We will filter out poor performed probes to get more reliable downstream analysis, they include  
+1. CpG with low detect p value  
+2. Probes overlapping with SNPs  
+3. Probes that cross reactive (can be get from Chen et al(2013)) (nCpG = 29,234)  
+4. Probes around 1000G SNPs (Fabien) (nCpG = 124,714)  
+5. Because all the samples are female, we **will not** remove probes on Sex Chromosomes  
+```{r filter probe,echo=FALSE,message=FALSE}
+## make sure detect_p and GRset CpG are in the same order
+detect_p = detect_p[featureNames(GRset_quantile),pData(GRset_quantile)$GSM]
+all.equal(rownames(detect_p),featureNames(GRset_quantile))
+all.equal(colnames(detect_p),pData(GRset_quantile)$GSM)
+
+## 1. filter out CpG with low detection p value, p value cutoff at 0.01
+pass_p = apply(detect_p,1,function(x)sum(x<0.01))
+keep = which(pass_p==33)
+GRset_quantile_f = GRset_quantile[keep,]
+
+## 2. drop probes overlapping with common SNPs
+snps = getSnpInfo(GRset_quantile_f)
+# add SNP information to GRset
+GRset_quantile_f = addSnpInfo(GRset_quantile_f)
+# drop probes has SNP
+GRset_quantile_f = dropLociWithSnps(GRset_quantile_f, snps=c("SBE","CpG"), maf=0)
+
+## 3. removal of cross-activated probes
+reactiveProbes = read.table("../GSE40576/reactive_probes.txt",sep="\t",header=T,stringsAsFactors = F)
+keep_reactive = which(!(featureNames(GRset_quantile_f) %in% reactiveProbes[,1]))
+GRset_quantile_f = GRset_quantile_f[keep_reactive,]
+
+## 4. removal of Probes around 1000G SNPs (Fabien)
+probes_1000G = read.table("../list_probe450K_SNP_MAF001_noCT_updated_040417.txt",sep="\t",header=T)
+keep_probe = which(!(featureNames(GRset_quantile_f) %in% probes_1000G$probe_ID))
+GRset_quantile_f = GRset_quantile_f[keep_probe,]
+
+saveRDS(GRset_quantile_f,file="methylation/GRset_quantile_filtered_NC_SLELNnegative.RDS")
+```
+
+# 6. replot MDS to examine after filtering
+We could see that the data clustered by their phenotype
+```{r MDS2,fig.align="center",fig.width=6,fig.height=6,echo=FALSE,message=FALSE}
+plotMDS(getM(GRset_quantile_f),top=1000, gene.selection = "common",
+        col=pal[as.factor(pData(GRset_quantile_f)$condition)],cex = 0.8,main="after filtering (Status)")
+```
+
+# 7 Estimate Cell Composition
+
+## 7-1 compute M and Beta values
+* M values for statistical analysis
+* Beta values for visualization
+```{r stats,echo=FALSE,message=FALSE}
+mVals = getM(GRset_quantile_f)
+bVals = getBeta(GRset_quantile_f)
+```
+
+## 7-2 estimate cell composition
+Here we used the `estimateCellCounts()` function from `minfi` package to estimate cell proportions. This method is a modification for Houseman (2012) method.
+**Note** Because of the function take RGSet (raw color intensity) as input, the GEO didn't provide raw data. We modified the function to fit our data format.
+
+```{r cell composition, fig.align="center",fig.width=6,fig.height=4,echo=FALSE,message=FALSE,warning=FALSE}
+# because the estimateCellCounts function requires a RGSet, which we don't have,
+# I modified the estimateCellCounts function to fit my MSet
+source("estimate_cell_type_function_modified.R")
+cellprops = estimate_cell_types(MSet)
+saveRDS(cellprops,file="Houseman_cell_proportion.RDS")
+
+## plot the composition between control and case
+pheno$disease = ifelse(pheno$condition=="NC","NC","SLE")
+cellprops = data.frame(cellprops,pheno)
+cellprops_melt = melt(cellprops[,c(1,2,3,4,5,6,8,9,12)])
+
+cell_g = ggplot(cellprops_melt,aes(x=variable,y=value,colour=condition)) + geom_boxplot(outlier.alpha = 0,position = position_dodge(width=0.9), fill="white",size=0.3) 
+cell_g = cell_g + geom_point(position=position_jitterdodge(dodge.width=0.9,jitter.width=0.2),size=1,alpha=0.75) + ylim(0,1)
+cell_g = cell_g + scale_x_discrete(limits=c("Bcell","CD4T","CD8T","Gran","Mono","NK"),
+                                   labels = c("Bcell"="B","CD4T"="CD4+ T","CD8T" = "CD8 + T","Gran" = "Granulocytes","Mono" = "Monocytes","NK" = "Natural Killer"))
+cell_g = cell_g + theme_classic() + scale_color_manual(values=c("#619CFF","#F8766D"))
+cell_g = cell_g + theme(legend.position = "bottom",
+                        axis.title = element_text(size=16,colour="black"),
+                        axis.text = element_text(size=16,colour="black",angle=0),
+                        axis.text.x = element_text(size=16,colour="black",angle=45,hjust=1,vjust=1),
+                        plot.title = element_text(size=18,face="bold"),
+                        legend.text = element_text(size=14),
+                        legend.title = element_text(size=14))
+cell_g = cell_g + labs(x="Cell Type",y="Proportion",title="Cell Composition (Our Analysis)")
+cell_g
+```
+
+
+# 8. PCA
+
+We did two PCA here:  
+1. PCA on cell composition estimated, then we test the association between phenotype and PCs to see if phenotype contribute to variance in cell composition.
+2. PCA on methylation data, then we test the association between phenotype+cell composition and PCs to see if phenotype or cell composition can be confounding variance to methylation data.
+
+## 8-1 PCA on cell composition and association with phenoData
+**From the PCA plot of PC1 and PC2, we could see that the PCs for cell composition clearly separate the disease status.**  
+```{r PCA cell composition,fig.align="center",fig.width=4,fig.height=4,echo=FALSE,message=FALSE}
+###################### first test if the PCA of cell composition correlate with demographic info ######################
+cellprop_pca = prcomp(cellprops[,1:6],scale. = T)
+cellprop_pca_res = cellprop_pca$x
+#all.equal(rownames(cellprop_pca_res),pheno$GSM)
+cellprop_pca_res = data.frame(cellprop_pca_res,pheno)
+
+cellprop_pca_g = ggplot(cellprop_pca_res,aes(x=PC1,y=PC2,colour=condition)) + geom_point() 
+cellprop_pca_g = cellprop_pca_g + theme_classic() + labs(title="PCA on Cell Composition")
+cellprop_pca_g = cellprop_pca_g + theme(legend.position = "bottom",
+                        axis.title = element_text(size=14,colour="black"),
+                        axis.text = element_text(size=14,colour="black",angle=0),
+                        plot.title = element_text(size=16,face="bold"),
+                        legend.text = element_text(size=14),
+                        legend.title = element_text(size=14))
+cellprop_pca_g
+```
+
+**The correlation heatmap confirmed that disease condition significantly associated with cell composition**  
+```{r PCA cell composition heatmap,fig.align="center",fig.width=4,fig.height=1.5,echo=FALSE,message=FALSE}
+## test association between pca of cell composition and demographic phenotype
+# 1. disease status
+cellprop_pval = NULL
+cellprop_r_sq = NULL
+factors = c("condition","age")
+for (sub_factor in factors){
+  sub_factor_data = cellprop_pca_res[,sub_factor]
+  sub_p = NULL
+  sub_r_sq = NULL
+  for (i in 1:6){
+    sub_pc = cellprop_pca_res[,paste0("PC",i)]
+    sub_lm = lm(sub_pc~sub_factor_data)
+
+    sub_p = c(sub_p,summary(sub_lm)$coefficients[2,4])
+    sub_r_sq = c(sub_r_sq,summary(sub_lm)$r.squared)
+  }
+  cellprop_pval = rbind(cellprop_pval,sub_p)
+  cellprop_r_sq = rbind(cellprop_r_sq,sub_r_sq)
+}
+rownames(cellprop_pval) = factors
+rownames(cellprop_r_sq) = factors
+colnames(cellprop_pval) = paste0("PC",1:6)
+colnames(cellprop_r_sq) = paste0("PC",1:6)
+    
+
+# log transform
+cellprop_log_p_val = -log10(cellprop_pval)
+
+col_pal1 =  colorRamp2(c(0,-log10(0.06),seq(-log10(0.05),max(as.vector(cellprop_log_p_val)),length.out = 9)), c("gray95","gray95", brewer.pal(9,"OrRd")))
+library(ComplexHeatmap)
+h = Heatmap(cellprop_log_p_val,
+            col = col_pal1,
+            row_title = "Known Factors",
+            row_title_side = "left",
+            show_row_names = T,
+            column_title = "SLE: Association between PCs of Houseman and Known Covariants",
+            column_title_gp = gpar(fontsize = 12,fontface="bold"),
+            column_title_side = "top",
+            cluster_rows =  F,
+            cluster_columns =  F,
+            row_names_gp = gpar(fontsize=14),
+            column_names_gp = gpar(fontsize=14),
+            rect_gp = gpar(col = "white", lwd = 2),
+            heatmap_legend_param = list(title = "-log10(P.Value)")
+)
+h
+```
+
+## 8-2 PCA on methylation data and association with phenoData and cell type
+
+From the heatmap we could see that PCs of methylation strongly associated with multiple cell types.
+```{r PCA on methylation,fig.align="center",fig.width=4,fig.height=3,echo=FALSE,message=FALSE}
+###################### pca on methylation data ######################
+pca = prcomp(t(getM(GRset_quantile_f)),scale. = T)
+pca_res = pca$x[,1:10]
+#all.equal(rownames(pca_res),rownames(cellprops))
+pca_res = data.frame(pca_res,cellprops)
+
+###################### test the association with demographic data ######################
+covariates = c("condition","age","CD8T","CD4T","NK","Bcell","Mono","Gran")
+methy_pval = NULL
+methy_r_sq = NULL
+
+for (sub_factor in covariates){
+  sub_factor_data = pca_res[,sub_factor]
+  sub_p = NULL
+  sub_r_sq = NULL
+  for (i in 1:10){
+    sub_pc = pca_res[,paste0("PC",i)]
+    sub_lm = lm(sub_pc~sub_factor_data)
+
+    sub_p = c(sub_p,summary(sub_lm)$coefficients[2,4])
+    sub_r_sq = c(sub_r_sq,summary(sub_lm)$r.squared)
+  }
+  methy_pval = rbind(methy_pval,sub_p)
+  methy_r_sq = rbind(methy_r_sq,sub_r_sq)
+}
+rownames(methy_pval) = covariates
+rownames(methy_r_sq) = covariates
+colnames(methy_pval) = paste0("PC",1:10)
+colnames(methy_r_sq) = paste0("PC",1:10)
+
+# log transformation
+log_p_val = -log10(methy_pval)
+
+col_pal2 =  colorRamp2(c(0,-log10(0.06),seq(-log10(0.05),max(as.vector(log_p_val)),length.out = 9)), c("gray95","gray95", brewer.pal(9,"BuGn")))
+h = Heatmap(log_p_val,
+            col = col_pal2,
+            row_title = "Known Factors and Houseman Proportions",
+            row_title_side = "left",
+            show_row_names = T,
+            column_title = "SLE: Association between PCs of Methylation and Known Covariants",
+            column_title_gp = gpar(fontsize = 14,fontface="bold"),
+            column_title_side = "top",
+            cluster_rows =  F,
+            cluster_columns =  F,
+            row_names_gp = gpar(fontsize=14),
+            column_names_gp = gpar(fontsize=14),
+            rect_gp = gpar(col = "white", lwd = 2),
+            heatmap_legend_param = list(title = "-log10(P.Value)")
+)
+h
+```
+
+## 8-3 Association between PCs of Houseman and PCs of methylation data
+```{r PC association,fig.align="center",fig.width=5,fig.height=3,echo=FALSE,message=FALSE}
+all.equal(rownames(cellprop_pca_res),rownames(pca_res))
+###### Association for batch adjusted
+pca_p = NULL
+pca_r_sq = NULL
+for (i in 1:6){
+    sub_pca_p = NULL
+    sub_pca_r_sq = NULL
+    sub_cell_pc = cellprop_pca_res[,i]
+    for (pc in 1:10){
+        sub_meth_pc = pca_res[,pc]
+        
+        sub_lm = lm(sub_meth_pc~sub_cell_pc)
+        
+        sub_r_sq = summary(sub_lm)$r.squared
+        sub_p = summary(sub_lm)$coefficients[2,4]
+        
+        sub_pca_p = c(sub_pca_p,sub_p)
+        sub_pca_r_sq = c(sub_pca_r_sq,sub_r_sq)
+    }
+    pca_p = cbind(pca_p,sub_pca_p)
+    pca_r_sq = cbind(pca_r_sq,sub_pca_r_sq)
+}
+colnames(pca_p) = paste0("houseman_pc",seq(1,6))
+rownames(pca_p) = paste0("methy_pc",seq(1,10))
+colnames(pca_r_sq) = paste0("houseman_pc",seq(1,6))
+rownames(pca_r_sq) = paste0("methy_pc",seq(1,10))
+
+pca_log_p = -log10(t(pca_p))
+
+col_pal2 =  colorRamp2(c(0,-log10(0.06),seq(-log10(0.05),max(as.vector(pca_log_p)),length.out = 9)), c("gray95","gray95", brewer.pal(9,"BuGn")))
+h = Heatmap(pca_log_p,
+            col = col_pal2,
+            row_title = "PCs of Houseman",
+            row_title_side = "left",
+            show_row_names = T,
+            column_title = "SLE: Association between PCs of Methylation and PCs of Houseman",
+            column_title_gp = gpar(fontsize = 14,fontface="bold"),
+            column_title_side = "top",
+            cluster_rows =  F,
+            cluster_columns =  F,
+            row_names_gp = gpar(fontsize=14),
+            column_names_gp = gpar(fontsize=14),
+            rect_gp = gpar(col = "white", lwd = 2),
+            heatmap_legend_param = list(title = "-log10(P.Value)")
+)
+h
+```
+
+## 8-4 Linear Regression between PCs of Metylation Data and Cell Proportions
+We do a linear regression between PCs of methylation data and cell propoprtions estimated from Houseman, to see to what degree cell proportions can explain the variantions in PC
+```{r PC Linear, fig.align="center",fig.width=8,fig.height=8,echo=FALSE,message=FALSE}
+PC1_fit = lm(PC1~CD8T+CD4T+NK+Bcell+Mono+Gran,data=pca_res)
+summary(PC1_fit)
+PC2_fit = lm(PC2~CD8T+CD4T+NK+Bcell+Mono+Gran,data=pca_res)
+summary(PC2_fit)
+```
+
+
+# 9 DMPs
+We will use `lmFit()` in `limma` to find the DMPs before and after the ajustment for cell composition
+
+## 9-1 No Adjustment
+
+Without any adjustment, there are **2,279** significant DMPs at FDR<=0.05 and Beta(case-control) >=10%
+```{r no correction,fig.align="center",fig.width=4,fig.height=4,echo=FALSE,message=FALSE,results="hide"}
+# design matrix
+design_no_correct = model.matrix(~0 + condition,data=pheno)
+colnames(design_no_correct) = c("NC","SLE_LN_negative")
+
+# fit the linear model
+#all.equal(colnames(mVals),rownames(design_no_correct))
+fit = lmFit(mVals,design_no_correct)
+
+# create contrast matrix
+contMatrix_no_correct = makeContrasts(SLE_LN_negative-NC,
+                                      levels=design_no_correct)
+fit2 = contrasts.fit(fit,contMatrix_no_correct)
+fit2 = eBayes(fit2)
+# SLE_LN_negative-NC
+DMP_no_correct = topTable(fit2, coef=1, num=Inf)
+
+# get the significant DMPs
+## calculate mean beta for each group
+beta_NC_no_correct = apply(bVals[,pheno$condition=="NC"],1,mean)
+beta_SLE_no_correct = apply(bVals[,pheno$condition=="SLE_LN_negative"],1,mean)
+#all.equal(names(beta_NC_no_correct),names(beta_SLE_no_correct))
+beta_change_no_correct = beta_SLE_no_correct - beta_NC_no_correct
+beta_change_no_correct = beta_change_no_correct[rownames(DMP_no_correct)]
+DMP_no_correct$delta_beta = beta_change_no_correct
+saveRDS(DMP_no_correct,file="DMP_no_correct.RDS")
+#all.equal(names(beta_change_no_correct),rownames(DMP_no_correct))
+## adjust_p<=0.05 & mean(delta Beta)>=10%
+sig_no_correct = DMP_no_correct[DMP_no_correct$adj.P.Val<=0.05&abs(beta_change_no_correct)>=0.1,]
+
+# volcano plot
+DMP_no_correct$is_sig = ifelse(DMP_no_correct$adj.P.Val<=0.05&abs(beta_change_no_correct)>=0.1,T,F)
+DMP_no_correct$beta_change = beta_change_no_correct
+x_limit = max(abs(DMP_no_correct$beta_change))
+x_limit = c(0-x_limit,x_limit)
+volcano_DMP_no_correct_g = ggplot(DMP_no_correct,aes(x=beta_change,y=-log10(adj.P.Val))) + geom_point(data=DMP_no_correct[DMP_no_correct$is_sig==F,],colour="black",size=0.3,alpha=0.5)
+volcano_DMP_no_correct_g = volcano_DMP_no_correct_g + geom_point(data=DMP_no_correct[DMP_no_correct$is_sig==T,],colour="red",alpha=0.5,size=0.4) + xlim(x_limit)
+volcano_DMP_no_correct_g = volcano_DMP_no_correct_g + labs(x="Beta Value Change (SLE-Control)",y="-log10(adj.P)",title=paste0("SLE DMPs No Adj (n=",sum(DMP_no_correct$is_sig),")"))
+volcano_DMP_no_correct_g = volcano_DMP_no_correct_g + theme_classic() + theme(axis.text.x=element_text(size=12,colour = "black"),
+                                                   axis.text.y=element_text(size=12,colour = "black"),
+                                                   axis.title=element_text(size=12,face="bold"),
+                                                   title = element_text(size=8,colour = "black"),
+                                                   legend.position="bottom")
+volcano_DMP_no_correct_g
+
+```
+
+
+## 9-2 only correct for demographic info: Age
+Because all samples are female, we will not correct for sex. Only age will be adjusted here.  
+We could see after the adjustment for age, **2,154** significant CpG are found
+```{r correct demographic,fig.align="center",fig.width=4,fig.height=4,echo=FALSE,message=FALSE,results="hide"}
+####################### correct age #######################
+# design matrix
+pheno$age = as.numeric(pheno$age)
+design_age = model.matrix(~0 + condition + age,data=pheno)
+colnames(design_age) = c("NC","SLE_LN_negative","Age")
+
+# fit the linear model
+#all.equal(colnames(mVals),rownames(design_age))
+fit_age = lmFit(mVals,design_age)
+
+# create contrast matrix
+contMatrix_age = makeContrasts(SLE_LN_negative-NC,levels=design_age)
+fit2_age = contrasts.fit(fit_age,contMatrix_age)
+fit2_age = eBayes(fit2_age)
+DMP_age = topTable(fit2_age, coef=1, num=Inf)
+
+# get the significant DMPs
+## calculate adjusted M and beta for each group, because beta will be >1 or <0, we calculate M first the convert M back to beta
+## the adjusted value is raw value minus the predicted value from age effect in the model
+mVals_age = mVals - (fit_age$coef[,3] %*% t(design_age[,3]))
+bVals_age = 2^mVals_age/(2^mVals_age+1)
+
+beta_NC_age = apply(bVals_age[,pheno$condition=="NC"],1,mean)
+beta_SLE_age = apply(bVals_age[,pheno$condition=="SLE_LN_negative"],1,mean)
+#all.equal(names(beta_NC_age),names(beta_SLE_age))
+beta_change_age = beta_SLE_age - beta_NC_age
+beta_change_age = beta_change_age[rownames(DMP_age)]
+DMP_age$delta_beta = beta_change_age
+saveRDS(DMP_age,file="DMP_age.RDS")
+write.csv(DMP_age,file="DMP_age.csv")
+#all.equal(names(beta_change_age),rownames(DMP_age))
+sum(abs(beta_change_age)>=0.1)
+
+## adjust_p<=0.05 & mean(delta Beta)>=10%
+sig_age = DMP_age[DMP_age$adj.P.Val<=0.05&abs(beta_change_age)>=0.1,]
+write.csv(sig_age,file="sig_age.csv")
+# volcano plot
+DMP_age$is_sig = ifelse(DMP_age$adj.P.Val<=0.05&abs(beta_change_age)>=0.1,T,F)
+DMP_age$beta_change = beta_change_age
+x_limit = max(abs(DMP_age$beta_change))
+x_limit = c(0-x_limit,x_limit)
+volcano_DMP_age_g = ggplot(DMP_age,aes(x=beta_change,y=-log10(adj.P.Val))) + geom_point(data=DMP_age[DMP_age$is_sig==F,],colour="black",size=0.3,alpha=0.5) + xlim(x_limit)
+volcano_DMP_age_g = volcano_DMP_age_g + geom_point(data=DMP_age[DMP_age$is_sig==T,],colour="red",alpha=0.5,size=0.4) + xlim(min(DMP_age$beta_change),abs(min(DMP_age$beta_change)))
+volcano_DMP_age_g = volcano_DMP_age_g + labs(x="Beta Value Change (SLE-Control)",y="-log10(adj.P)",title=paste0("SLE DMPs Adjusted for Age (n=",sum(DMP_age$is_sig),")"))
+volcano_DMP_age_g = volcano_DMP_age_g + theme_classic() + theme(axis.text.x=element_text(size=12,colour = "black"),
+                                                   axis.text.y=element_text(size=12,colour = "black"),
+                                                   axis.title=element_text(size=12,face="bold"),
+                                                   title = element_text(size=8,colour = "black"),
+                                                   legend.position="bottom")
+volcano_DMP_age_g
+
+```
+
+## 9-3 correct for all cell composition
+If we adjust for all cell types, only **13** CpG left
+```{r correct all cell composition,fig.align="center",fig.width=6,fig.height=6,echo=FALSE,message=FALSE,results="hide"}
+####################### 1. correct all cell composition #######################
+cellprops$age = as.numeric(cellprops$age)
+## 1. Fit the LM model to find DMPs
+# design matrix
+design_cell_all = model.matrix(~0 + condition + age + CD8T + CD4T + NK + Bcell + Mono + Gran, data=cellprops)
+colnames(design_cell_all) = c("NC","SLE_LN_negative","Age","CD8T","CD4T","NK","Bcell","Mono","Gran")
+
+# fit the linear model
+#all.equal(colnames(mVals),rownames(design_cell_all))
+fit_cell_all = lmFit(mVals,design_cell_all)
+
+# create contrast matrix
+contMatrix_cell_all = makeContrasts(SLE_LN_negative-NC,
+                                   levels=design_cell_all)
+fit2_cell_all = contrasts.fit(fit_cell_all,contMatrix_cell_all)
+fit2_cell_all = eBayes(fit2_cell_all)
+
+DMP_cell_all = topTable(fit2_cell_all, coef=1, num=Inf)
+
+# get the significant DMPs
+## calculate adjusted M and beta
+mVals_cell_all = mVals - (fit_cell_all$coef[,-c(1,2)] %*% t(design_cell_all[,-c(1,2)]))
+bVals_cell_all = 2^mVals_cell_all/(2^mVals_cell_all+1)
+
+beta_NC_cell_all = apply(bVals_cell_all[,pheno$condition=="NC"],1,mean)
+beta_SLE_cell_all = apply(bVals_cell_all[,pheno$condition=="SLE_LN_negative"],1,mean)
+#all.equal(names(beta_NC_cell_all),names(beta_SLE_cell_all))
+beta_change_cell_all = beta_SLE_cell_all - beta_NC_cell_all
+beta_change_cell_all = beta_change_cell_all[rownames(DMP_cell_all)]
+DMP_cell_all$delta_beta = beta_change_cell_all
+saveRDS(DMP_cell_all,file="DMP_cell_all.RDS")
+#all.equal(names(beta_change_cell_all),rownames(DMP_cell_all))
+sum(abs(beta_change_cell_all)>=0.1)
+
+## adjust_p<=0.05 & mean(delta Beta)>=10%
+sig_cell_all = DMP_cell_all[DMP_cell_all$adj.P.Val<=0.05&abs(beta_change_cell_all)>=0.1,]
+write.csv(sig_cell_all,file="sig_cell_all.csv")
+# volcano plot
+DMP_cell_all$is_sig = ifelse(DMP_cell_all$adj.P.Val<=0.05&abs(beta_change_cell_all)>=0.1,T,F)
+DMP_cell_all$beta_change = beta_change_cell_all
+
+volcano_DMP_cell_all_g = ggplot(DMP_cell_all,aes(x=beta_change,y=-log10(adj.P.Val))) + geom_point(data=DMP_cell_all[DMP_cell_all$is_sig==F,],colour="black",size=0.3,alpha=0.5)
+volcano_DMP_cell_all_g = volcano_DMP_cell_all_g + geom_point(data=DMP_cell_all[DMP_cell_all$is_sig==T,],colour="red",alpha=0.5,size=0.4)
+volcano_DMP_cell_all_g = volcano_DMP_cell_all_g + labs(x="Beta Value Change (SLE-Control)",y="-log10(adj.P)",title=paste0("SLE DMPs Adjusted for Houseman Cell (n=",sum(DMP_cell_all$is_sig),")"))
+volcano_DMP_cell_all_g = volcano_DMP_cell_all_g + theme_classic() + theme(axis.text.x=element_text(size=12,colour = "black"),
+                                                   axis.text.y=element_text(size=12,colour = "black"),
+                                                   axis.title=element_text(size=12,face="bold"),
+                                                   title = element_text(size=8,colour = "black"),
+                                                   legend.position="bottom")
+volcano_DMP_cell_all_g
+```
+
+## 9-4 correct for all cell composition using PCs instead of actual Cell Proportions
+Because of the collinearity in the cell proportions, here we use PCs of PCA from cell proportions as regressors instead of actual cell proportions
+to get rid of the collinearity problems.  
+Because from the previous association, PC1-PC5 all showed great association, we will use all PCs here
+If we adjust for PCs of all cell types, there are **40** CpG left
+```{r correct all cell composition by PCs,fig.align="center",fig.width=4,fig.height=4,echo=FALSE,message=FALSE}
+####################### 1. correct all cell composition #######################
+cellprop_pca_res$age = as.numeric(cellprop_pca_res$age)
+
+houseman_pc_asso_max = apply(pca_log_p,1,max)
+which(houseman_pc_asso_max>2&summary(cellprop_pca)$importance[2,]>0.01)
+## 1. Fit the LM model to find DMPs
+# design matrix
+design_cell_pc = model.matrix(~0 + condition + age + PC1 + PC2 + PC3 + PC4 + PC5 , data=cellprop_pca_res)
+colnames(design_cell_pc)[1:2] = c("NC","SLE_LN_negative")
+
+# fit the linear model
+all.equal(colnames(mVals),rownames(design_cell_pc))
+fit_cell_pc = lmFit(mVals,design_cell_pc)
+
+# create contrast matrix
+contMatrix_cell_pc = makeContrasts(SLE_LN_negative-NC,
+                                   levels=design_cell_pc)
+fit2_cell_pc = contrasts.fit(fit_cell_pc,contMatrix_cell_pc)
+fit2_cell_pc = eBayes(fit2_cell_pc)
+
+DMP_cell_pc = topTable(fit2_cell_pc, coef=1, num=Inf)
+
+# get the significant DMPs
+## calculate adjusted M and beta
+mVals_cell_pc = mVals - (fit_cell_pc$coef[,-c(1,2)] %*% t(design_cell_pc[,-c(1,2)]))
+bVals_cell_pc = 2^mVals_cell_pc/(2^mVals_cell_pc+1)
+
+beta_NC_cell_pc = apply(bVals_cell_pc[,pheno$condition=="NC"],1,mean)
+beta_SLE_cell_pc = apply(bVals_cell_pc[,pheno$condition=="SLE_LN_negative"],1,mean)
+all.equal(names(beta_NC_cell_pc),names(beta_SLE_cell_pc))
+beta_change_cell_pc = beta_SLE_cell_pc - beta_NC_cell_pc
+beta_change_cell_pc = beta_change_cell_pc[rownames(DMP_cell_pc)]
+all.equal(names(beta_change_cell_pc),rownames(DMP_cell_pc))
+DMP_cell_pc$delta_beta = beta_change_cell_pc
+saveRDS(DMP_cell_pc,file="DMP_cell_pc.RDS")
+## adjust_p<=0.05 & mean(delta Beta)>=10%
+sig_cell_pc = DMP_cell_pc[DMP_cell_pc$adj.P.Val<=0.05&abs(beta_change_cell_pc)>=0.1,]
+write.csv(sig_cell_pc,file="sig_cell_pc.csv")
+# volcano plot
+DMP_cell_pc$is_sig = ifelse(DMP_cell_pc$adj.P.Val<=0.05&abs(beta_change_cell_pc)>=0.1,T,F)
+DMP_cell_pc$beta_change = beta_change_cell_pc
+x_limit = max(abs(DMP_cell_pc$beta_change))
+x_limit = c(0-x_limit,x_limit)
+volcano_DMP_cell_pc_g = ggplot(DMP_cell_pc,aes(x=beta_change,y=-log10(adj.P.Val))) + geom_point(data=DMP_cell_pc[DMP_cell_pc$is_sig==F,],colour="black",size=0.5,alpha=0.5)
+volcano_DMP_cell_pc_g = volcano_DMP_cell_pc_g + geom_point(data=DMP_cell_pc[DMP_cell_pc$is_sig==T,],colour="red",alpha=1,size=1)  + xlim(x_limit)
+volcano_DMP_cell_pc_g = volcano_DMP_cell_pc_g + labs(x="Beta Value Change (SLE-Control)",y="-log10(adj.P)",title=paste0("SLE DMPs Adjusted for Houseman Cell PCs (n=",sum(DMP_cell_pc$is_sig),")"))
+volcano_DMP_cell_pc_g = volcano_DMP_cell_pc_g + theme_classic() + theme(axis.text.x=element_text(size=12,colour = "black"),
+                                                   axis.text.y=element_text(size=12,colour = "black"),
+                                                   axis.title=element_text(size=12,face="bold"),
+                                                   title = element_text(size=8,colour = "black"),
+                                                   legend.position="bottom")
+volcano_DMP_cell_pc_g
+```
+
+
+# 10. Gene Ontology Testing for DMPs
+We wanted to test if the gene ontology changes before and after we adjusted cell composition, and if so, which GO analysis has more biological significance.
+
+We are using `gometh` function in `missMethyl` package
+`gometh` has the similar logic as `goseq`, which will correct the bias that genes have more CpGs will have more powers to be detected as differentially methylated.
+
+## 10-1 GO 
+From the GO Term Analysis here, we could see that the enriched GO terms from DMPs after cell type adjustment are more clearly related to immune reponse  
+The removed GO Terms after cell type adjustment are mainly noise terms
+```{r GO ,fig.align="center",fig.width=4,fig.height=4,echo=FALSE,message=FALSE,warning=FALSE}
+library("missMethyl")
+# background all CpG sites used for analysis
+all_cpg = rownames(bVals)
+
+############### 1. No Correct ###############
+sigCpGs_no_correct = rownames(sig_no_correct)
+
+gst_no_correct = gometh(sigCpGs_no_correct,all_cpg,collection = "GO",
+                         array.type = "450K",plot.bias = F)
+print("No Adjustment")
+sig_gst_no_correct = gst_no_correct[gst_no_correct$FDR<=0.05,]
+sum(gst_no_correct$FDR<=0.05)
+topGO(gst_no_correct,number=10)
+
+############### 2. Age ###############
+sigCpGs_age = rownames(sig_age)
+
+gst_age = gometh(sigCpGs_age,all_cpg,collection = "GO",
+                         array.type = "450K",plot.bias = F)
+
+print("Age Adjustment")
+sig_gst_age = gst_age[gst_age$FDR<=0.05,]
+sum(gst_age$FDR<=0.05)
+sigGO_age = topGO(gst_age,number=336)
+#write.table(sigGO_age,file="~/Dropbox/PBMC/Manuscript/PBMC_New_Plot_09262017/SLE/sig_GO_Age.txt",sep="\t",row.names = T,col.names = F,quote = F)
+############### 3. Cell All ###############
+sigCpGs_cell_all = rownames(sig_cell_all)
+
+gst_cell_all = gometh(sigCpGs_cell_all,all_cpg,collection = "GO",
+                         array.type = "450K",plot.bias = F)
+print("All Cell Type Adjustment")
+sig_gst_cell_all = gst_cell_all[gst_cell_all$FDR<=0.05,]
+sum(gst_cell_all$FDR<=0.05)
+topGO(gst_cell_all,number=10)
+
+############### 4. Cell All PCs ###############
+sigCpGs_cell_pc = rownames(sig_cell_pc)
+
+gst_cell_pc = gometh(sigCpGs_cell_pc,all_cpg,collection = "GO",
+                         array.type = "450K",plot.bias = F)
+print("All Cell Type PCs Adjustment")
+sig_gst_cell_pc = gst_cell_pc[gst_cell_pc$FDR<=0.05,]
+sum(gst_cell_pc$FDR<=0.05)
+sig_GO = topGO(gst_cell_pc,number=58)
+write.table(sig_GO,file="~/Dropbox/PBMC/Manuscript/PBMC_New_Plot_09262017/SLE/sig_GO_PC.txt",sep="\t",row.names = T,col.names = F,quote = F)
+write.table(gst_cell_pc[gst_cell_pc$FDR<0.05,],file="GO_sig_Cell_All_PCs.txt",row.names = T,col.names = T,sep="\t",quote = F)
+write.table(gst_cell_all[gst_cell_all$FDR<0.05,],file="GO_sig_Cell_All.txt",row.names = T,col.names = T,sep="\t",quote = F)
+write.table(gst_age[gst_age$FDR<0.05,],file="GO_sig_age.txt",row.names = T,col.names = T,sep="\t",quote = F)
+write.table(gst_no_correct[gst_no_correct$FDR<0.05,],file="GO_sig_no_correct.txt",row.names = T,col.names = T,sep="\t",quote = F)
+```
